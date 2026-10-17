@@ -4,10 +4,14 @@ import android.Manifest;
 import android.app.Activity;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.graphics.Color;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.provider.Settings;
+import android.view.Menu;
+import android.view.MenuItem;
+import android.view.View;
 import android.view.ViewGroup;
 import android.widget.Button;
 import android.widget.LinearLayout;
@@ -78,12 +82,27 @@ public class MainActivity extends Activity {
     }
 
     @Override
+    public boolean onCreateOptionsMenu(Menu menu) {
+        int p = (int) (16 * getResources().getDisplayMetrics().density);
+        TextView tv = new TextView(this);
+        tv.setText("≡");
+        tv.setTextSize(30);
+        tv.setTextColor(Color.WHITE);
+        tv.setPadding(p, 0, p, 0);
+        tv.setOnClickListener(v -> startActivity(new Intent(this, SettingsActivity.class)));
+        MenuItem mi = menu.add(0, 1, 0, "ตั้งค่า");
+        mi.setActionView(tv);
+        mi.setShowAsAction(MenuItem.SHOW_AS_ACTION_ALWAYS);
+        return true;
+    }
+
+    @Override
     protected void onResume() {
         super.onResume();
         boolean ok = Settings.canDrawOverlays(this);
         status.setText(ok ? "พร้อมใช้งาน แตะเพื่อเปิดหน้าต่างลอย"
                 : "ต้องให้สิทธิ์ \"แสดงทับแอปอื่น\" ก่อน");
-        permBtn.setVisibility(ok ? android.view.View.GONE : android.view.View.VISIBLE);
+        permBtn.setVisibility(ok ? View.GONE : View.VISIBLE);
     }
 
     private void askOverlay() {

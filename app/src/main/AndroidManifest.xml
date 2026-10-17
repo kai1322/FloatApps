@@ -21,6 +21,11 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".SettingsActivity"
+            android:exported="false"
+            android:label="ตั้งค่า" />
+
         <service
             android:name=".FloatService"
             android:exported="false"

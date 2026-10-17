@@ -19,6 +19,7 @@ import java.util.List;
 public class FloatService extends Service {
 
     static final String EXTRA_TYPE = "type";
+    static FloatService instance;
 
     final List<FloatWindow> windows = new ArrayList<>();
     WindowManager wm;
@@ -27,6 +28,7 @@ public class FloatService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
+        instance = this;
         wm = (WindowManager) getSystemService(WINDOW_SERVICE);
         startFg();
     }
@@ -117,6 +119,31 @@ public class FloatService extends Service {
         stopSelf();
     }
 
+    // ---- used by the settings screen ----
+    void applyStyleAll() {
+        for (FloatWindow w : windows) {
+            w.applyStyle();
+            w.applyBubbleSize();
+        }
+    }
+
+    int saveAllGeoms() {
+        int n = 0;
+        for (FloatWindow w : windows) if (w.saveGeomQuiet()) n++;
+        return n;
+    }
+
+    int saveAllBubbles() {
+        int n = 0;
+        for (FloatWindow w : windows) {
+            if (w.minimized) {
+                w.saveBubbleQuiet();
+                n++;
+            }
+        }
+        return n;
+    }
+
     void notifyChanged() {
         for (FloatWindow w : windows) w.refreshList();
     }
@@ -125,6 +152,7 @@ public class FloatService extends Service {
     public void onDestroy() {
         for (FloatWindow w : new ArrayList<>(windows)) w.close();
         windows.clear();
+        if (instance == this) instance = null;
         super.onDestroy();
     }
 
