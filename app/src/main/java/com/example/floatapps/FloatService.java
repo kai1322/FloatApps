@@ -6,31 +6,68 @@ import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.ServiceInfo;
 import android.os.Build;
+import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
 import android.provider.Settings;
 import android.view.WindowManager;
+import android.webkit.WebView;
 import android.widget.Toast;
 
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+import java.io.File;
+import java.io.PrintWriter;
+import java.io.StringWriter;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 
 public class FloatService extends Service {
 
     static final String EXTRA_TYPE = "type";
     static FloatService instance;
+    private static boolean crashLogSet;
 
     final List<FloatWindow> windows = new ArrayList<>();
     WindowManager wm;
     private int counter = 0;
+
+    // open windows are remembered so they come back if the system kills the app
+    private final Handler hs = new Handler(Looper.getMainLooper());
+    private final Runnable saveTask = this::saveSession;
 
     @Override
     public void onCreate() {
         super.onCreate();
         instance = this;
         wm = (WindowManager) getSystemService(WINDOW_SERVICE);
+        installCrashLog();
         startFg();
+    }
+
+    /** Writes the last uncaught error to files/crash.txt (then lets Android handle it as usual). */
+    private void installCrashLog() {
+        if (crashLogSet) return;
+        crashLogSet = true;
+        final Thread.UncaughtExceptionHandler prev = Thread.getDefaultUncaughtExceptionHandler();
+        final File f = new File(getFilesDir(), "crash.txt");
+        Thread.setDefaultUncaughtExceptionHandler((t, e) -> {
+            try {
+                StringWriter sw = new StringWriter();
+                e.printStackTrace(new PrintWriter(sw));
+                Files.write(f.toPath(), (System.currentTimeMillis() + "\n" + sw)
+                        .getBytes(StandardCharsets.UTF_8));
+            } catch (Throwable ignored) {
+            }
+            if (prev != null) prev.uncaughtException(t, e);
+        });
     }
 
     private void startFg() {
@@ -59,10 +96,29 @@ public class FloatService extends Service {
             stopSelf();
             return START_NOT_STICKY;
         }
-        if (intent != null && intent.getStringExtra(EXTRA_TYPE) != null) {
+        if (intent == null) {
+            // restarted by the system after the app was killed: bring the windows back,
+            // but give up if that keeps failing (a page that crashes the app every time)
+            long now = System.currentTimeMillis();
+            SharedPreferences pr = prefs();
+            int n = (now - pr.getLong("restore_t", 0) < 120000) ? pr.getInt("restore_n", 0) + 1 : 1;
+            pr.edit().putLong("restore_t", now).putInt("restore_n", n).apply();
+            if (n > 3) {
+                pr.edit().remove("session").apply();
+                stopSelf();
+                return START_NOT_STICKY;
+            }
+            if (windows.isEmpty()) restoreSession();
+            if (windows.isEmpty()) {
+                stopSelf();
+                return START_NOT_STICKY;
+            }
+            return START_STICKY;
+        }
+        if (intent.getStringExtra(EXTRA_TYPE) != null) {
             open(intent.getStringExtra(EXTRA_TYPE));
         }
-        return START_NOT_STICKY;
+        return START_STICKY;
     }
 
     private String titleFor(String type) {
@@ -77,11 +133,16 @@ public class FloatService extends Service {
     }
 
     void open(String type) {
+        open(type, null);
+    }
+
+    /** sess != null when a window is being restored from the saved session. */
+    void open(String type, JSONObject sess) {
         // Only the browser can have several windows; others reuse the existing one.
         if (!FloatWindow.T_WEB.equals(type)) {
             for (FloatWindow w : windows) {
                 if (w.type.equals(type)) {
-                    focusWindow(w);
+                    if (sess == null) focusWindow(w);
                     return;
                 }
             }
@@ -90,11 +151,14 @@ public class FloatService extends Service {
         for (FloatWindow w : windows) if (w.type.equals(type)) same++;
         String title = titleFor(type) + (same > 0 ? " " + (same + 1) : "");
         try {
-            FloatWindow w = new FloatWindow(this, type, title, counter++);
+            FloatWindow w = new FloatWindow(this, type, title, counter++, sess);
             w.show();
             windows.add(w);
+            if (sess != null && sess.optBoolean("minimized", false)) w.minimizeToBubble();
             w.refreshList();
             notifyChanged();
+            updatePower();
+            scheduleSave();
         } catch (Exception e) {
             Toast.makeText(this, "เปิดหน้าต่างไม่ได้: " + e.getMessage(), Toast.LENGTH_LONG).show();
             if (windows.isEmpty()) stopSelf();
@@ -110,7 +174,9 @@ public class FloatService extends Service {
         w.close();
         windows.remove(w);
         notifyChanged();
+        updatePower();
         if (windows.isEmpty()) stopSelf();
+        else scheduleSave();
     }
 
     void closeAll() {
@@ -148,10 +214,95 @@ public class FloatService extends Service {
         for (FloatWindow w : windows) w.refreshList();
     }
 
+    // ---- saving the open windows so they survive the app being killed ----
+    void scheduleSave() {
+        hs.removeCallbacks(saveTask);
+        hs.postDelayed(saveTask, 1500);
+    }
+
+    private SharedPreferences prefs() {
+        return getSharedPreferences("float_prefs", MODE_PRIVATE);
+    }
+
+    void saveSession() {
+        if (windows.isEmpty()) return;
+        JSONArray a = new JSONArray();
+        for (FloatWindow w : windows) {
+            if (w.type.equals(FloatWindow.T_LIST)) continue;
+            try {
+                a.put(w.toJson());
+            } catch (Exception ignored) {
+            }
+        }
+        prefs().edit().putString("session", a.toString()).apply();
+    }
+
+    private void restoreSession() {
+        String s = prefs().getString("session", null);
+        if (s == null) return;
+        try {
+            JSONArray a = new JSONArray(s);
+            List<String> ok = Arrays.asList(FloatWindow.ALL_TYPES);
+            for (int i = 0; i < a.length(); i++) {
+                JSONObject o = a.optJSONObject(i);
+                if (o == null) continue;
+                String t = o.optString("type", "");
+                if (ok.contains(t)) open(t, o);
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    // ---- saving battery / CPU / RAM ----
+
+    /**
+     * When every web window is minimized (and none of them is YouTube, which must keep
+     * playing), stop all page timers/JavaScript. They start again as soon as a window is opened.
+     */
+    void updatePower() {
+        boolean any = false;
+        boolean idle = true;
+        for (FloatWindow w : windows) {
+            if (!w.hasWeb()) continue;
+            any = true;
+            if (!w.minimized || w.type.equals(FloatWindow.T_YT)) {
+                idle = false;
+                break;
+            }
+        }
+        try {
+            if (any && idle) WebView.pauseTimers();
+            else WebView.resumeTimers();
+        } catch (Exception ignored) {
+        }
+    }
+
+    @Override
+    public void onTrimMemory(int level) {
+        super.onTrimMemory(level);
+        // 10/15 = running low/critical on memory; 60/80 = system is reclaiming
+        boolean pressure = (level >= 10 && level < 20) || level >= 60;
+        boolean critical = (level >= 15 && level < 20) || level >= 80;
+        if (!pressure) return;
+        for (FloatWindow w : new ArrayList<>(windows)) {
+            try {
+                w.trimMemory(critical);
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
     @Override
     public void onDestroy() {
         for (FloatWindow w : new ArrayList<>(windows)) w.close();
         windows.clear();
+        hs.removeCallbacks(saveTask);
+        // a normal stop (not a kill) means the user is done: forget the saved windows
+        prefs().edit().remove("session").apply();
+        try {
+            WebView.resumeTimers();
+        } catch (Exception ignored) {
+        }
         if (instance == this) instance = null;
         super.onDestroy();
     }
