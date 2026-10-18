@@ -124,7 +124,6 @@ public class FloatService extends Service {
         for (FloatWindow w : windows) {
             w.applyStyle();
             w.applyBubbleSize();
-            w.applyMiniSize();
         }
     }
 

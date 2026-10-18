@@ -145,9 +145,9 @@ public class SettingsActivity extends Activity {
 
         // ---- YouTube mini player ----
         box.addView(text("มินิเพลเยอร์ YouTube", 16, true));
-        box.addView(text("กดปุ่ม — ตอนมีวิดีโอเล่นอยู่ จะหดเป็นช่องเล็ก ลากย้ายได้ (จำตำแหน่งให้อัตโนมัติ)",
+        box.addView(text("กดปุ่ม ◀ ตอนดูวิดีโออยู่ วิดีโอจะหดเป็นช่องเล็กในหน้าต่าง ลากย้ายและดึงมุมเพื่อย่อขยายได้อิสระ แตะเพื่อขยายกลับ (จำตำแหน่งและขนาดให้อัตโนมัติ)",
                 13, false));
-        box.addView(text("ขนาดช่อง (บันทึกอัตโนมัติ)", 14, false));
+        box.addView(text("ขนาดเริ่มต้นของช่อง (บันทึกอัตโนมัติ)", 14, false));
         final RadioGroup rg2 = new RadioGroup(this);
         rg2.setOrientation(RadioGroup.HORIZONTAL);
         final int[] ids2 = new int[3];
@@ -169,8 +169,8 @@ public class SettingsActivity extends Activity {
             }
         });
         box.addView(rg2);
-        box.addView(button("รีเซ็ตตำแหน่งมินิเพลเยอร์", v -> {
-            sp.edit().remove("mini.x").remove("mini.y").apply();
+        box.addView(button("รีเซ็ตตำแหน่ง/ขนาดมินิเพลเยอร์", v -> {
+            sp.edit().remove("ytmini.x").remove("ytmini.y").remove("ytmini.w").remove("ytmini.h").apply();
             Toast.makeText(this, "รีเซ็ตแล้ว มีผลตอนย่อครั้งถัดไป", Toast.LENGTH_SHORT).show();
         }));
 

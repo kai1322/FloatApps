@@ -32,6 +32,7 @@ import android.view.WindowManager;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputMethodManager;
 import android.webkit.CookieManager;
+import android.webkit.WebBackForwardList;
 import android.webkit.RenderProcessGoneDetail;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceRequest;
@@ -82,6 +83,10 @@ public class FloatWindow {
 
     static final String JS_HAS_VIDEO = "(function(){var v=document.querySelector('video');"
             + "return !!(v&&v.currentSrc&&v.readyState>0&&v.duration>0);})()";
+    static final String JS_MARK = "(function(){var v=document.querySelector('video');"
+            + "window.__wasPlaying=!!(v&&!v.paused);return 'ok';})()";
+    static final String JS_RESUME = "(function(){var v=document.querySelector('video');"
+            + "if(v&&window.__wasPlaying&&v.paused){v.play();}return 'ok';})()";
     static final String JS_PAUSED = "(function(){var v=document.querySelector('video');"
             + "return (v&&v.paused)?'paused':'playing';})()";
     static final String JS_TOGGLE = "(function(){var v=document.querySelector('video');"
@@ -131,9 +136,10 @@ public class FloatWindow {
     TextView rz, bubble;
     WindowManager.LayoutParams blp;
     boolean rootAttached, bubbleAttached, minimized, bubLongDone;
-    boolean miniMode;          // YouTube mini player (small video-only window)
-    int miniPrevW, miniPrevH;
-    FrameLayout miniOverlay;
+    // YouTube in-window mini player (the playing video shrinks while you browse the feed)
+    boolean miniOn;
+    Tab miniTab;
+    FrameLayout miniBox;
     TextView miniPlay;
     int restX, restY;          // where the WINDOW reappears
     int bubX, bubY, bubSize;   // where/how big the minimized ICON is (independent of the window)
@@ -319,9 +325,8 @@ public class FloatWindow {
         bar.setBackgroundColor(0xFF2D2D2D);
         if (isWeb) {
             bar.setPadding(dp(4), 0, 0, 0);
-            bar.addView(btn("◀", v -> {
-                if (web != null && web.canGoBack()) web.goBack();
-            }), new LinearLayout.LayoutParams(dp(36), MATCH));
+            bar.addView(btn("◀", v -> onWebBack()),
+                    new LinearLayout.LayoutParams(dp(36), MATCH));
             bar.addView(btn("⟳", v -> {
                 if (web != null) web.reload();
             }), new LinearLayout.LayoutParams(dp(36), MATCH));
@@ -428,32 +433,153 @@ public class FloatWindow {
             }
         });
 
-        if (type.equals(T_YT)) buildMiniOverlay();
         applyStyle();
     }
 
-    // ---------- YouTube mini player ----------
+    // ---------- YouTube in-window mini player ----------
+    static boolean isWatchUrl(String u) {
+        return u != null && u.contains("/watch");
+    }
+
     int readMiniSize() {
         int v = sp.getInt("minisize", 1);
         return (v < 0 || v >= MINI_DP.length) ? 1 : v;
     }
 
-    void buildMiniOverlay() {
-        miniOverlay = new FrameLayout(svc);
-        miniOverlay.setVisibility(View.GONE);
-        miniOverlay.setOnTouchListener(new View.OnTouchListener() {
+    /** Back button: on a watch page with a video, shrink it into the mini player instead of leaving. */
+    void onWebBack() {
+        if (web == null) return;
+        if (type.equals(T_YT) && !miniOn && isWatchUrl(web.getUrl())) {
+            web.evaluateJavascript(JS_HAS_VIDEO, r -> {
+                if ("true".equals(r) && web != null) collapseToMini();
+                else if (web != null && web.canGoBack()) web.goBack();
+            });
+            return;
+        }
+        if (web.canGoBack()) web.goBack();
+    }
+
+    void collapseToMini() {
+        if (web == null || curTab == null || !type.equals(T_YT)) return;
+        if (miniOn) closeMini();
+        final Tab player = curTab;
+        String prev = homeUrl();
+        try {
+            WebBackForwardList bfl = web.copyBackForwardList();
+            int ci = bfl.getCurrentIndex();
+            if (ci > 0) {
+                String u = bfl.getItemAtIndex(ci - 1).getUrl();
+                if (u != null && u.startsWith("http") && !isWatchUrl(u)) prev = u;
+            }
+        } catch (Exception ignored) {
+        }
+        player.wv.evaluateJavascript(JS_MARK, null);
+        tabs.remove(player);
+        webHost.removeView(player.wv);
+        miniTab = player;
+        miniOn = true;
+        curTab = null;
+        web = null;
+        newTab(prev, true);   // the page you were on before the video, shown behind the mini player
+        buildMiniBox(player);
+        player.wv.evaluateJavascript(JS_MINI_ON, null);
+        player.wv.evaluateJavascript(JS_PAUSED, r -> {
+            miniPlay.setText(r != null && r.contains("paused") ? "▶" : "❚❚");
+        });
+        h.postDelayed(() -> {
+            if (miniTab == player) player.wv.evaluateJavascript(JS_RESUME, null);
+        }, 350);
+    }
+
+    void expandMini() {
+        if (!miniOn || miniTab == null) return;
+        final Tab player = miniTab;
+        player.wv.evaluateJavascript(JS_MARK, null);
+        player.wv.evaluateJavascript(JS_MINI_OFF, null);
+        if (miniBox != null) {
+            miniBox.removeView(player.wv);
+            webHost.removeView(miniBox);
+            miniBox = null;
+        }
+        // the page that was open behind the mini player is dropped
+        Tab browse = curTab;
+        if (browse != null) {
+            tabs.remove(browse);
+            webHost.removeView(browse.wv);
+            browse.wv.stopLoading();
+            browse.wv.destroy();
+        }
+        miniTab = null;
+        miniOn = false;
+        tabs.add(player);
+        webHost.addView(player.wv, 0, new FrameLayout.LayoutParams(MATCH, MATCH));
+        selectTab(player);
+        h.postDelayed(() -> {
+            if (player.wv != null) player.wv.evaluateJavascript(JS_RESUME, null);
+        }, 350);
+    }
+
+    void closeMini() {
+        if (!miniOn) return;
+        Tab p = miniTab;
+        if (miniBox != null) {
+            if (p != null) miniBox.removeView(p.wv);
+            webHost.removeView(miniBox);
+            miniBox = null;
+        }
+        if (p != null) {
+            p.wv.stopLoading();
+            p.wv.destroy();
+        }
+        miniTab = null;
+        miniOn = false;
+    }
+
+    void toggleMiniPlay() {
+        if (miniTab == null) return;
+        miniTab.wv.evaluateJavascript(JS_TOGGLE, r -> {
+            miniPlay.setText(r != null && r.contains("paused") ? "▶" : "❚❚");
+        });
+    }
+
+    void saveMiniGeom() {
+        if (miniBox == null) return;
+        FrameLayout.LayoutParams p = (FrameLayout.LayoutParams) miniBox.getLayoutParams();
+        sp.edit().putInt("ytmini.x", p.leftMargin).putInt("ytmini.y", p.topMargin)
+                .putInt("ytmini.w", p.width).putInt("ytmini.h", p.height).apply();
+    }
+
+    void buildMiniBox(final Tab player) {
+        int hostW = webHost.getWidth() > 0 ? webHost.getWidth() : lp.width - dp(2);
+        int hostH = webHost.getHeight() > 0 ? webHost.getHeight() : lp.height - dp(36);
+        int w = Math.min(sp.getInt("ytmini.w", dp(MINI_DP[readMiniSize()])), hostW);
+        int hh = Math.min(sp.getInt("ytmini.h", Math.round(w * 9f / 16f)), hostH);
+        int x = sp.getInt("ytmini.x", hostW - w - dp(8));
+        int y = sp.getInt("ytmini.y", hostH - hh - dp(8));
+        x = Math.max(0, Math.min(x, hostW - w));
+        y = Math.max(0, Math.min(y, hostH - hh));
+
+        miniBox = new FrameLayout(svc);
+        miniBox.setBackgroundColor(Color.BLACK);
+        miniBox.addView(player.wv, new FrameLayout.LayoutParams(MATCH, MATCH));
+
+        // tap = expand, drag = move
+        FrameLayout touch = new FrameLayout(svc);
+        touch.setOnTouchListener(new View.OnTouchListener() {
             float dx, dy;
             int sx, sy;
             boolean dragging;
 
             @Override
             public boolean onTouch(View v, MotionEvent e) {
+                if (miniBox == null) return false;
+                FrameLayout.LayoutParams p = (FrameLayout.LayoutParams) miniBox.getLayoutParams();
                 switch (e.getActionMasked()) {
                     case MotionEvent.ACTION_DOWN:
                         dx = e.getRawX();
                         dy = e.getRawY();
-                        sx = lp.x;
-                        sy = lp.y;
+                        sx = p.leftMargin;
+                        sy = p.topMargin;
                         dragging = false;
                         return true;
                     case MotionEvent.ACTION_MOVE:
@@ -461,22 +587,22 @@ public class FloatWindow {
                             dragging = true;
                         }
                         if (dragging) {
-                            lp.x = sx + (int) (e.getRawX() - dx);
-                            lp.y = sy + (int) (e.getRawY() - dy);
-                            updateLayout();
+                            p.leftMargin = Math.max(0, Math.min(sx + (int) (e.getRawX() - dx),
+                                    Math.max(0, webHost.getWidth() - p.width)));
+                            p.topMargin = Math.max(0, Math.min(sy + (int) (e.getRawY() - dy),
+                                    Math.max(0, webHost.getHeight() - p.height)));
+                            miniBox.setLayoutParams(p);
                         }
                         return true;
                     case MotionEvent.ACTION_UP:
-                        if (dragging) {
-                            sp.edit().putInt("mini.x", lp.x).putInt("mini.y", lp.y).apply();
-                        } else {
-                            expandMini();
-                        }
+                        if (dragging) saveMiniGeom();
+                        else expandMini();
                         return true;
                 }
                 return false;
             }
         });
+        miniBox.addView(touch, new FrameLayout.LayoutParams(MATCH, MATCH));
 
         miniPlay = label("❚❚", 13, Color.WHITE);
         miniPlay.setGravity(Gravity.CENTER);
@@ -488,7 +614,7 @@ public class FloatWindow {
         FrameLayout.LayoutParams pp = new FrameLayout.LayoutParams(dp(30), dp(30),
                 Gravity.BOTTOM | Gravity.START);
         pp.setMargins(dp(6), 0, 0, dp(6));
-        miniOverlay.addView(miniPlay, pp);
+        miniBox.addView(miniPlay, pp);
 
         TextView close = label("✕", 13, Color.WHITE);
         close.setGravity(Gravity.CENTER);
@@ -496,74 +622,52 @@ public class FloatWindow {
         cbg.setShape(GradientDrawable.OVAL);
         cbg.setColor(0xAA000000);
         close.setBackground(cbg);
-        close.setOnClickListener(v -> svc.closeWindow(this));
+        close.setOnClickListener(v -> closeMini());
         FrameLayout.LayoutParams cp = new FrameLayout.LayoutParams(dp(30), dp(30),
                 Gravity.TOP | Gravity.END);
         cp.setMargins(0, dp(6), dp(6), 0);
-        miniOverlay.addView(close, cp);
+        miniBox.addView(close, cp);
 
-        root.addView(miniOverlay, new FrameLayout.LayoutParams(MATCH, MATCH));
-    }
+        // free resize (drag the corner)
+        TextView handle = label("◢", 16, 0xFFDDDDDD);
+        handle.setGravity(Gravity.CENTER);
+        handle.setOnTouchListener(new View.OnTouchListener() {
+            float dx, dy;
+            int sw, sh;
 
-    void toggleMiniPlay() {
-        if (web == null) return;
-        web.evaluateJavascript(JS_TOGGLE, r -> {
-            miniPlay.setText(r != null && r.contains("paused") ? "▶" : "❚❚");
+            @Override
+            public boolean onTouch(View v, MotionEvent e) {
+                if (miniBox == null) return false;
+                FrameLayout.LayoutParams p = (FrameLayout.LayoutParams) miniBox.getLayoutParams();
+                switch (e.getActionMasked()) {
+                    case MotionEvent.ACTION_DOWN:
+                        dx = e.getRawX();
+                        dy = e.getRawY();
+                        sw = p.width;
+                        sh = p.height;
+                        return true;
+                    case MotionEvent.ACTION_MOVE:
+                        int maxW = Math.max(dp(120), webHost.getWidth() - p.leftMargin);
+                        int maxH = Math.max(dp(70), webHost.getHeight() - p.topMargin);
+                        p.width = Math.max(dp(120), Math.min(sw + (int) (e.getRawX() - dx), maxW));
+                        p.height = Math.max(dp(70), Math.min(sh + (int) (e.getRawY() - dy), maxH));
+                        miniBox.setLayoutParams(p);
+                        return true;
+                    case MotionEvent.ACTION_UP:
+                        saveMiniGeom();
+                        return true;
+                }
+                return false;
+            }
         });
-    }
+        miniBox.addView(handle, new FrameLayout.LayoutParams(dp(30), dp(30),
+                Gravity.BOTTOM | Gravity.END));
 
-    void enterMini() {
-        if (minimized || !rootAttached || web == null) return;
-        prepareMinimize();
-        DisplayMetrics dm = svc.getResources().getDisplayMetrics();
-        restX = lp.x;
-        restY = lp.y;
-        miniPrevW = lp.width;
-        miniPrevH = lp.height;
-        minimized = true;
-        miniMode = true;
-        int w = dp(MINI_DP[readMiniSize()]);
-        int hgt = Math.round(w * 9f / 16f);
-        lp.flags = FLAGS;
-        lp.width = w;
-        lp.height = hgt;
-        lp.x = Math.max(0, Math.min(sp.getInt("mini.x", dm.widthPixels - w - dp(12)), dm.widthPixels - w));
-        lp.y = Math.max(0, Math.min(sp.getInt("mini.y", dm.heightPixels - hgt - dp(96)), dm.heightPixels - hgt));
-        bar.setVisibility(View.GONE);
-        rz.setVisibility(View.GONE);
-        miniOverlay.setVisibility(View.VISIBLE);
-        updateLayout();
-        web.evaluateJavascript(JS_MINI_ON, null);
-        web.evaluateJavascript(JS_PAUSED, r -> {
-            miniPlay.setText(r != null && r.contains("paused") ? "▶" : "❚❚");
-        });
-        svc.notifyChanged();
-    }
-
-    void expandMini() {
-        if (!miniMode) return;
-        miniMode = false;
-        minimized = false;
-        if (web != null) web.evaluateJavascript(JS_MINI_OFF, null);
-        miniOverlay.setVisibility(View.GONE);
-        bar.setVisibility(View.VISIBLE);
-        rz.setVisibility(View.VISIBLE);
-        lp.flags = FLAGS;
-        lp.width = miniPrevW;
-        lp.height = miniPrevH;
-        lp.x = restX;
-        lp.y = restY;
-        updateLayout();
-        svc.notifyChanged();
-    }
-
-    /** Called from settings when the mini size changes. */
-    void applyMiniSize() {
-        if (!miniMode) return;
-        int w = dp(MINI_DP[readMiniSize()]);
-        lp.width = w;
-        lp.height = Math.round(w * 9f / 16f);
-        updateLayout();
+        FrameLayout.LayoutParams mlp = new FrameLayout.LayoutParams(w, hh,
+                Gravity.TOP | Gravity.START);
+        mlp.leftMargin = x;
+        mlp.topMargin = y;
+        webHost.addView(miniBox, mlp);
     }
 
     // ---------- link bar (browser) ----------
@@ -673,7 +777,7 @@ public class FloatWindow {
         t.url = url;
         t.wv = createWebView(t);
         t.wv.setVisibility(View.GONE);
-        webHost.addView(t.wv, new FrameLayout.LayoutParams(MATCH, MATCH));
+        webHost.addView(t.wv, 0, new FrameLayout.LayoutParams(MATCH, MATCH));
         tabs.add(t);
         if (tabRow != null) addChip(t);
         if (url != null) t.wv.loadUrl(url);
@@ -772,13 +876,21 @@ public class FloatWindow {
             @Override
             public void onPageStarted(WebView v, String u, Bitmap favicon) {
                 t.url = u;
+                if (miniOn && t == curTab && (isWatchUrl(u) || (u != null && u.contains("/shorts/")))) {
+                    h.post(() -> closeMini());
+                }
             }
 
             // The web renderer can die (e.g. Facebook's endless feed eats memory). Without this
             // the whole app is killed; instead rebuild just this tab and reload its page.
             @Override
             public boolean onRenderProcessGone(WebView v, RenderProcessGoneDetail detail) {
-                if (t.wv == v) h.post(() -> recreateTab(t));
+                if (t.wv == v) {
+                    h.post(() -> {
+                        if (t == miniTab) closeMini();
+                        else recreateTab(t);
+                    });
+                }
                 return true;
             }
         });
@@ -870,7 +982,7 @@ public class FloatWindow {
         } catch (Exception ignored) {
         }
         t.wv = createWebView(t);
-        webHost.addView(t.wv, new FrameLayout.LayoutParams(MATCH, MATCH));
+        webHost.addView(t.wv, 0, new FrameLayout.LayoutParams(MATCH, MATCH));
         t.wv.setVisibility(wasCurrent ? View.VISIBLE : View.GONE);
         if (wasCurrent) web = t.wv;
         t.wv.loadUrl((t.url != null && !t.url.isEmpty()) ? t.url : homeUrl());
@@ -1114,14 +1226,6 @@ public class FloatWindow {
      * The bubble has its own saved position/size, independent of the window.
      */
     void minimize() {
-        if (minimized || !rootAttached) return;
-        if (type.equals(T_YT) && web != null) {
-            web.evaluateJavascript(JS_HAS_VIDEO, r -> {
-                if ("true".equals(r)) enterMini();
-                else minimizeToBubble();
-            });
-            return;
-        }
         minimizeToBubble();
     }
 
@@ -1150,10 +1254,6 @@ public class FloatWindow {
 
     void restore() {
         if (!minimized) return;
-        if (miniMode) {
-            expandMini();
-            return;
-        }
         hideBubble();
         minimized = false;
         lp.flags = FLAGS;
@@ -1186,6 +1286,7 @@ public class FloatWindow {
             rootAttached = false;
         }
         hideBubble();
+        if (webHost != null) closeMini();
         if (webHost != null) webHost.removeAllViews();
         for (Tab t : new ArrayList<>(tabs)) {
             t.wv.stopLoading();
@@ -1310,7 +1411,7 @@ public class FloatWindow {
                 }
                 return true;
             }
-            if (a == MotionEvent.ACTION_DOWN && !miniMode
+            if (a == MotionEvent.ACTION_DOWN
                     && (lp.flags & WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE) != 0) {
                 lp.flags &= ~WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
                 updateLayout();
@@ -1326,7 +1427,7 @@ public class FloatWindow {
                     return true;
                 }
                 if (web != null && web.canGoBack()) {
-                    if (e.getAction() == KeyEvent.ACTION_UP) web.goBack();
+                    if (e.getAction() == KeyEvent.ACTION_UP) onWebBack();
                     return true;
                 }
             }
