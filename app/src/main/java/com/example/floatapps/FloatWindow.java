@@ -5,9 +5,11 @@ import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.SharedPreferences;
+import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.graphics.PixelFormat;
 import android.graphics.drawable.GradientDrawable;
+import android.net.Uri;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.Message;
@@ -27,8 +29,10 @@ import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
+import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputMethodManager;
 import android.webkit.CookieManager;
+import android.webkit.RenderProcessGoneDetail;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebResourceResponse;
@@ -73,6 +77,33 @@ public class FloatWindow {
     // bubble (minimized icon) sizes in dp: small / medium / large
     static final int[] BUB_DP = {38, 48, 60};
     static final int[] BUB_TEXT = {13, 16, 20};
+    // YouTube mini player widths in dp: small / medium / large (16:9)
+    static final int[] MINI_DP = {180, 240, 320};
+
+    static final String JS_HAS_VIDEO = "(function(){var v=document.querySelector('video');"
+            + "return !!(v&&v.currentSrc&&v.readyState>0&&v.duration>0);})()";
+    static final String JS_PAUSED = "(function(){var v=document.querySelector('video');"
+            + "return (v&&v.paused)?'paused':'playing';})()";
+    static final String JS_TOGGLE = "(function(){var v=document.querySelector('video');"
+            + "if(!v)return 'x';if(v.paused){v.play();return 'playing';}v.pause();return 'paused';})()";
+    // make the <video> fill the whole (small) window and hide everything else
+    static final String JS_MINI_ON = "(function(){var v=document.querySelector('video');"
+            + "if(!v)return 'no';window.__miniSaved=[];var a=v.parentElement;"
+            + "while(a&&a!==document.documentElement){window.__miniSaved.push([a,a.getAttribute('style')]);"
+            + "['transform','contain','filter','clip-path'].forEach(function(p){a.style.setProperty(p,'none','important');});"
+            + "a.style.setProperty('overflow','visible','important');a=a.parentElement;}"
+            + "var s=document.getElementById('__miniStyle');"
+            + "if(!s){s=document.createElement('style');s.id='__miniStyle';document.head.appendChild(s);}"
+            + "s.textContent='html,body{overflow:hidden !important;background:#000 !important;}"
+            + "body *{visibility:hidden !important;}"
+            + "video{visibility:visible !important;position:fixed !important;left:0 !important;top:0 !important;"
+            + "width:100vw !important;height:100vh !important;max-width:none !important;max-height:none !important;"
+            + "margin:0 !important;z-index:2147483647 !important;background:#000 !important;object-fit:contain !important;}';"
+            + "return 'ok';})()";
+    static final String JS_MINI_OFF = "(function(){var s=document.getElementById('__miniStyle');if(s)s.remove();"
+            + "var arr=window.__miniSaved||[];for(var i=0;i<arr.length;i++){var a=arr[i][0],st=arr[i][1];"
+            + "if(st===null)a.removeAttribute('style');else a.setAttribute('style',st);}"
+            + "window.__miniSaved=[];try{window.dispatchEvent(new Event('resize'));}catch(e){}return 'ok';})()";
 
     // Third-party ad / tracker hosts that get blocked inside the web windows.
     static final String[] AD_HOSTS = {
@@ -100,6 +131,10 @@ public class FloatWindow {
     TextView rz, bubble;
     WindowManager.LayoutParams blp;
     boolean rootAttached, bubbleAttached, minimized, bubLongDone;
+    boolean miniMode;          // YouTube mini player (small video-only window)
+    int miniPrevW, miniPrevH;
+    FrameLayout miniOverlay;
+    TextView miniPlay;
     int restX, restY;          // where the WINDOW reappears
     int bubX, bubY, bubSize;   // where/how big the minimized ICON is (independent of the window)
 
@@ -107,6 +142,7 @@ public class FloatWindow {
     class Tab {
         WebView wv;
         String title = "แท็บใหม่";
+        String url;
         LinearLayout chip;
         TextView chipTitle;
     }
@@ -115,7 +151,8 @@ public class FloatWindow {
     Tab curTab;
     WebView web; // always the WebView of the current tab
     FrameLayout webHost;
-    LinearLayout tabRow;
+    LinearLayout tabRow, urlRow;
+    EditText urlEdit;
 
     EditText editor;
     LinearLayout listBox;
@@ -391,7 +428,142 @@ public class FloatWindow {
             }
         });
 
+        if (type.equals(T_YT)) buildMiniOverlay();
         applyStyle();
+    }
+
+    // ---------- YouTube mini player ----------
+    int readMiniSize() {
+        int v = sp.getInt("minisize", 1);
+        return (v < 0 || v >= MINI_DP.length) ? 1 : v;
+    }
+
+    void buildMiniOverlay() {
+        miniOverlay = new FrameLayout(svc);
+        miniOverlay.setVisibility(View.GONE);
+        miniOverlay.setOnTouchListener(new View.OnTouchListener() {
+            float dx, dy;
+            int sx, sy;
+            boolean dragging;
+
+            @Override
+            public boolean onTouch(View v, MotionEvent e) {
+                switch (e.getActionMasked()) {
+                    case MotionEvent.ACTION_DOWN:
+                        dx = e.getRawX();
+                        dy = e.getRawY();
+                        sx = lp.x;
+                        sy = lp.y;
+                        dragging = false;
+                        return true;
+                    case MotionEvent.ACTION_MOVE:
+                        if (Math.abs(e.getRawX() - dx) > dp(8) || Math.abs(e.getRawY() - dy) > dp(8)) {
+                            dragging = true;
+                        }
+                        if (dragging) {
+                            lp.x = sx + (int) (e.getRawX() - dx);
+                            lp.y = sy + (int) (e.getRawY() - dy);
+                            updateLayout();
+                        }
+                        return true;
+                    case MotionEvent.ACTION_UP:
+                        if (dragging) {
+                            sp.edit().putInt("mini.x", lp.x).putInt("mini.y", lp.y).apply();
+                        } else {
+                            expandMini();
+                        }
+                        return true;
+                }
+                return false;
+            }
+        });
+
+        miniPlay = label("❚❚", 13, Color.WHITE);
+        miniPlay.setGravity(Gravity.CENTER);
+        GradientDrawable pbg = new GradientDrawable();
+        pbg.setShape(GradientDrawable.OVAL);
+        pbg.setColor(0xAA000000);
+        miniPlay.setBackground(pbg);
+        miniPlay.setOnClickListener(v -> toggleMiniPlay());
+        FrameLayout.LayoutParams pp = new FrameLayout.LayoutParams(dp(30), dp(30),
+                Gravity.BOTTOM | Gravity.START);
+        pp.setMargins(dp(6), 0, 0, dp(6));
+        miniOverlay.addView(miniPlay, pp);
+
+        TextView close = label("✕", 13, Color.WHITE);
+        close.setGravity(Gravity.CENTER);
+        GradientDrawable cbg = new GradientDrawable();
+        cbg.setShape(GradientDrawable.OVAL);
+        cbg.setColor(0xAA000000);
+        close.setBackground(cbg);
+        close.setOnClickListener(v -> svc.closeWindow(this));
+        FrameLayout.LayoutParams cp = new FrameLayout.LayoutParams(dp(30), dp(30),
+                Gravity.TOP | Gravity.END);
+        cp.setMargins(0, dp(6), dp(6), 0);
+        miniOverlay.addView(close, cp);
+
+        root.addView(miniOverlay, new FrameLayout.LayoutParams(MATCH, MATCH));
+    }
+
+    void toggleMiniPlay() {
+        if (web == null) return;
+        web.evaluateJavascript(JS_TOGGLE, r -> {
+            miniPlay.setText(r != null && r.contains("paused") ? "▶" : "❚❚");
+        });
+    }
+
+    void enterMini() {
+        if (minimized || !rootAttached || web == null) return;
+        prepareMinimize();
+        DisplayMetrics dm = svc.getResources().getDisplayMetrics();
+        restX = lp.x;
+        restY = lp.y;
+        miniPrevW = lp.width;
+        miniPrevH = lp.height;
+        minimized = true;
+        miniMode = true;
+        int w = dp(MINI_DP[readMiniSize()]);
+        int hgt = Math.round(w * 9f / 16f);
+        lp.flags = FLAGS;
+        lp.width = w;
+        lp.height = hgt;
+        lp.x = Math.max(0, Math.min(sp.getInt("mini.x", dm.widthPixels - w - dp(12)), dm.widthPixels - w));
+        lp.y = Math.max(0, Math.min(sp.getInt("mini.y", dm.heightPixels - hgt - dp(96)), dm.heightPixels - hgt));
+        bar.setVisibility(View.GONE);
+        rz.setVisibility(View.GONE);
+        miniOverlay.setVisibility(View.VISIBLE);
+        updateLayout();
+        web.evaluateJavascript(JS_MINI_ON, null);
+        web.evaluateJavascript(JS_PAUSED, r -> {
+            miniPlay.setText(r != null && r.contains("paused") ? "▶" : "❚❚");
+        });
+        svc.notifyChanged();
+    }
+
+    void expandMini() {
+        if (!miniMode) return;
+        miniMode = false;
+        minimized = false;
+        if (web != null) web.evaluateJavascript(JS_MINI_OFF, null);
+        miniOverlay.setVisibility(View.GONE);
+        bar.setVisibility(View.VISIBLE);
+        rz.setVisibility(View.VISIBLE);
+        lp.flags = FLAGS;
+        lp.width = miniPrevW;
+        lp.height = miniPrevH;
+        lp.x = restX;
+        lp.y = restY;
+        updateLayout();
+        svc.notifyChanged();
+    }
+
+    /** Called from settings when the mini size changes. */
+    void applyMiniSize() {
+        if (!miniMode) return;
+        int w = dp(MINI_DP[readMiniSize()]);
+        lp.width = w;
+        lp.height = Math.round(w * 9f / 16f);
+        updateLayout();
     }
 
     // ---------- link bar (browser) ----------
@@ -456,8 +628,38 @@ public class FloatWindow {
             tabRow.setOrientation(LinearLayout.HORIZONTAL);
             hs.addView(tabRow, new FrameLayout.LayoutParams(WRAP, MATCH));
             strip.addView(hs, new LinearLayout.LayoutParams(0, MATCH, 1f));
+            TextView urlBtn = btn("URL", v -> toggleUrlRow());
+            urlBtn.setTextSize(11);
+            strip.addView(urlBtn, new LinearLayout.LayoutParams(dp(40), MATCH));
             strip.addView(btn("+", v -> newTab(HOME, true)), new LinearLayout.LayoutParams(dp(34), MATCH));
             box.addView(strip, new LinearLayout.LayoutParams(MATCH, dp(30)));
+
+            urlRow = new LinearLayout(svc);
+            urlRow.setOrientation(LinearLayout.HORIZONTAL);
+            urlRow.setGravity(Gravity.CENTER_VERTICAL);
+            urlRow.setBackgroundColor(0xFF2A2A2A);
+            urlRow.setPadding(dp(4), dp(3), dp(4), dp(3));
+            urlRow.setVisibility(View.GONE);
+            urlEdit = new EditText(svc);
+            urlEdit.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
+            urlEdit.setMaxLines(1);
+            urlEdit.setTextSize(13);
+            urlEdit.setTextColor(Color.BLACK);
+            urlEdit.setHint("พิมพ์ URL หรือคำค้นหา");
+            urlEdit.setHintTextColor(0xFF777777);
+            urlEdit.setBackgroundColor(0xFFEEEEEE);
+            urlEdit.setPadding(dp(8), 0, dp(8), 0);
+            urlEdit.setImeOptions(EditorInfo.IME_ACTION_GO);
+            urlEdit.setOnEditorActionListener((v, actionId, ev) -> {
+                goUrl(urlEdit.getText().toString());
+                return true;
+            });
+            urlRow.addView(urlEdit, new LinearLayout.LayoutParams(0, dp(34), 1f));
+            TextView goBtn = btn("ไป", v -> goUrl(urlEdit.getText().toString()));
+            goBtn.setTextSize(14);
+            urlRow.addView(goBtn, new LinearLayout.LayoutParams(dp(44), dp(34)));
+            box.addView(urlRow, new LinearLayout.LayoutParams(MATCH, WRAP));
+
             box.addView(webHost, new LinearLayout.LayoutParams(MATCH, 0, 1f));
             newTab(startUrl, true);
             return box;
@@ -468,6 +670,7 @@ public class FloatWindow {
 
     Tab newTab(String url, boolean select) {
         final Tab t = new Tab();
+        t.url = url;
         t.wv = createWebView(t);
         t.wv.setVisibility(View.GONE);
         webHost.addView(t.wv, new FrameLayout.LayoutParams(MATCH, MATCH));
@@ -531,6 +734,7 @@ public class FloatWindow {
         s.setJavaScriptEnabled(true);
         s.setDomStorageEnabled(true);
         s.setLoadWithOverviewMode(true);
+        if (type.equals(T_YT)) s.setMediaPlaybackRequiresUserGesture(false);
         if (type.equals(T_WEB)) {
             s.setSupportMultipleWindows(true);
             // long-press a link -> small bar: open in new tab / copy link
@@ -563,6 +767,19 @@ public class FloatWindow {
             public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest r) {
                 String sch = r.getUrl().getScheme();
                 return !("http".equals(sch) || "https".equals(sch));
+            }
+
+            @Override
+            public void onPageStarted(WebView v, String u, Bitmap favicon) {
+                t.url = u;
+            }
+
+            // The web renderer can die (e.g. Facebook's endless feed eats memory). Without this
+            // the whole app is killed; instead rebuild just this tab and reload its page.
+            @Override
+            public boolean onRenderProcessGone(WebView v, RenderProcessGoneDetail detail) {
+                if (t.wv == v) h.post(() -> recreateTab(t));
+                return true;
             }
         });
 
@@ -600,6 +817,64 @@ public class FloatWindow {
             }
         });
         return w;
+    }
+
+    // ---------- home page per type, URL entry, crash recovery ----------
+    String homeUrl() {
+        switch (type) {
+            case T_FB: return "https://m.facebook.com/";
+            case T_YT: return "https://m.youtube.com/";
+            case T_TR: return "https://translate.google.com/?sl=auto&tl=th";
+            default:   return HOME;
+        }
+    }
+
+    void toggleUrlRow() {
+        if (urlRow == null) return;
+        if (urlRow.getVisibility() == View.VISIBLE) {
+            urlRow.setVisibility(View.GONE);
+            return;
+        }
+        urlRow.setVisibility(View.VISIBLE);
+        String cur = (web != null) ? web.getUrl() : null;
+        urlEdit.setText(cur == null ? "" : cur);
+        urlEdit.selectAll();
+        // the window only becomes focusable after this tap, so wait a moment for the keyboard
+        h.postDelayed(() -> {
+            urlEdit.requestFocus();
+            InputMethodManager imm = (InputMethodManager) svc.getSystemService(Context.INPUT_METHOD_SERVICE);
+            imm.showSoftInput(urlEdit, InputMethodManager.SHOW_IMPLICIT);
+        }, 250);
+    }
+
+    void goUrl(String in) {
+        in = in.trim();
+        if (in.isEmpty() || web == null) return;
+        String u;
+        if (in.startsWith("http://") || in.startsWith("https://")) u = in;
+        else if (in.contains(".") && !in.contains(" ")) u = "https://" + in;
+        else u = "https://www.google.com/search?q=" + Uri.encode(in);
+        web.loadUrl(u);
+        urlEdit.clearFocus();
+        InputMethodManager imm = (InputMethodManager) svc.getSystemService(Context.INPUT_METHOD_SERVICE);
+        imm.hideSoftInputFromWindow(urlEdit.getWindowToken(), 0);
+        urlRow.setVisibility(View.GONE);
+    }
+
+    void recreateTab(Tab t) {
+        if (!tabs.contains(t) || webHost == null) return;
+        boolean wasCurrent = (curTab == t);
+        webHost.removeView(t.wv);
+        try {
+            t.wv.destroy();
+        } catch (Exception ignored) {
+        }
+        t.wv = createWebView(t);
+        webHost.addView(t.wv, new FrameLayout.LayoutParams(MATCH, MATCH));
+        t.wv.setVisibility(wasCurrent ? View.VISIBLE : View.GONE);
+        if (wasCurrent) web = t.wv;
+        t.wv.loadUrl((t.url != null && !t.url.isEmpty()) ? t.url : homeUrl());
+        Toast.makeText(svc, "หน้าเว็บค้าง รีโหลดให้อัตโนมัติแล้ว", Toast.LENGTH_SHORT).show();
     }
 
     // ---------- fullscreen video (exit with the player's own button or Back) ----------
@@ -840,10 +1115,26 @@ public class FloatWindow {
      */
     void minimize() {
         if (minimized || !rootAttached) return;
+        if (type.equals(T_YT) && web != null) {
+            web.evaluateJavascript(JS_HAS_VIDEO, r -> {
+                if ("true".equals(r)) enterMini();
+                else minimizeToBubble();
+            });
+            return;
+        }
+        minimizeToBubble();
+    }
+
+    void prepareMinimize() {
         if (customView != null) exitFull();
         hideLinkBar();
         InputMethodManager imm = (InputMethodManager) svc.getSystemService(Context.INPUT_METHOD_SERVICE);
         imm.hideSoftInputFromWindow(root.getWindowToken(), 0);
+    }
+
+    void minimizeToBubble() {
+        if (minimized || !rootAttached) return;
+        prepareMinimize();
         restX = lp.x;
         restY = lp.y;
         minimized = true;
@@ -859,6 +1150,10 @@ public class FloatWindow {
 
     void restore() {
         if (!minimized) return;
+        if (miniMode) {
+            expandMini();
+            return;
+        }
         hideBubble();
         minimized = false;
         lp.flags = FLAGS;
@@ -1015,7 +1310,7 @@ public class FloatWindow {
                 }
                 return true;
             }
-            if (a == MotionEvent.ACTION_DOWN
+            if (a == MotionEvent.ACTION_DOWN && !miniMode
                     && (lp.flags & WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE) != 0) {
                 lp.flags &= ~WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
                 updateLayout();

@@ -143,6 +143,37 @@ public class SettingsActivity extends Activity {
                     Toast.LENGTH_SHORT).show();
         }));
 
+        // ---- YouTube mini player ----
+        box.addView(text("มินิเพลเยอร์ YouTube", 16, true));
+        box.addView(text("กดปุ่ม — ตอนมีวิดีโอเล่นอยู่ จะหดเป็นช่องเล็ก ลากย้ายได้ (จำตำแหน่งให้อัตโนมัติ)",
+                13, false));
+        box.addView(text("ขนาดช่อง (บันทึกอัตโนมัติ)", 14, false));
+        final RadioGroup rg2 = new RadioGroup(this);
+        rg2.setOrientation(RadioGroup.HORIZONTAL);
+        final int[] ids2 = new int[3];
+        for (int i = 0; i < 3; i++) {
+            RadioButton rb = new RadioButton(this);
+            rb.setText(names[i]);
+            rb.setId(View.generateViewId());
+            ids2[i] = rb.getId();
+            rg2.addView(rb);
+        }
+        int cur2 = sp.getInt("minisize", 1);
+        rg2.check(ids2[(cur2 < 0 || cur2 > 2) ? 1 : cur2]);
+        rg2.setOnCheckedChangeListener((g, id) -> {
+            for (int i = 0; i < 3; i++) {
+                if (ids2[i] == id) {
+                    sp.edit().putInt("minisize", i).apply();
+                    applyLive();
+                }
+            }
+        });
+        box.addView(rg2);
+        box.addView(button("รีเซ็ตตำแหน่งมินิเพลเยอร์", v -> {
+            sp.edit().remove("mini.x").remove("mini.y").apply();
+            Toast.makeText(this, "รีเซ็ตแล้ว มีผลตอนย่อครั้งถัดไป", Toast.LENGTH_SHORT).show();
+        }));
+
         // ---- window position / size ----
         box.addView(text("ตำแหน่งและขนาดหน้าต่าง", 16, true));
         box.addView(text("บันทึกเฉพาะหน้าต่างที่เปิดอยู่ (ไม่ได้ย่อ)", 13, false));
