@@ -2,14 +2,17 @@ package com.example.floatapps;
 
 import android.annotation.SuppressLint;
 import android.app.DownloadManager;
+import android.content.ContentValues;
 import android.content.Intent;
-import android.os.Bundle;
+import android.os.Build;
 import android.os.Environment;
-import android.os.SystemClock;
+import android.provider.MediaStore;
+import android.util.Base64;
+import android.webkit.JavascriptInterface;
 import android.webkit.URLUtil;
 import android.webkit.ValueCallback;
-import org.json.JSONArray;
 import org.json.JSONObject;
+import java.io.OutputStream;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
@@ -76,11 +79,6 @@ public class FloatWindow {
 
     static final String HOME = "https://www.google.com/";
 
-    // low-resource mode: at most this many browser tabs keep a live WebView; the rest are
-    // "frozen" (only URL + page state kept) and rebuilt when selected
-    static final int MAX_LIVE_TABS = 3;
-    static final long TAB_GRACE_MS = 20000;
-
     static final int MATCH = ViewGroup.LayoutParams.MATCH_PARENT;
     static final int WRAP = ViewGroup.LayoutParams.WRAP_CONTENT;
 
@@ -104,11 +102,15 @@ public class FloatWindow {
     static final String JS_PAUSED = "(function(){var v=document.querySelector('video');"
             + "return (v&&v.paused)?'paused':'playing';})()";
     static final String JS_TOGGLE = "(function(){var v=document.querySelector('video');if(!v)return 'x';"
-            + "if(v.paused){window.__userPaused=false;var p=v.play();if(p&&p.catch)p.catch(function(){});return 'playing';}"
+            + "if(v.paused){window.__userPaused=false;window.__resumes=0;var p=v.play();if(p&&p.catch)p.catch(function(){});return 'playing';}"
             + "window.__userPaused=true;v.pause();return 'paused';})()";
     // if the page pauses the video by itself (not the user), start it again
     static final String JS_KEEP = "(function(){var v=document.querySelector('video');if(!v)return 'x';"
-            + "if(v.paused&&!window.__userPaused){var p=v.play();if(p&&p.catch)p.catch(function(){});}"
+            + "if(!v.paused){window.__okChecks=(window.__okChecks||0)+1;"
+            + "if(window.__okChecks>=4){window.__resumes=0;}return 'playing';}"
+            + "window.__okChecks=0;"
+            + "if(!window.__userPaused&&(window.__resumes||0)<3){window.__resumes=(window.__resumes||0)+1;"
+            + "var p=v.play();if(p&&p.catch)p.catch(function(){});}"
             + "return v.paused?'paused':'playing';})()";
     // make the page believe it is always visible, so it does not pause itself
     static final String JS_NOHIDE = "(function(){try{['hidden','webkitHidden'].forEach(function(k){"
@@ -120,7 +122,7 @@ public class FloatWindow {
             + "document.addEventListener(n,function(e){e.stopImmediatePropagation();},true);});}return 'ok';})()";
     // make the <video> fill the whole (small) window and hide everything else
     static final String JS_MINI_ON = "(function(){var v=document.querySelector('video');"
-            + "if(!v)return 'no';window.__userPaused=v.paused;window.__miniSaved=[];var a=v.parentElement;"
+            + "if(!v)return 'no';window.__userPaused=v.paused;window.__resumes=0;window.__okChecks=0;window.__miniSaved=[];var a=v.parentElement;"
             + "while(a&&a!==document.documentElement){window.__miniSaved.push([a,a.getAttribute('style')]);"
             + "['transform','contain','filter','clip-path'].forEach(function(p){a.style.setProperty(p,'none','important');});"
             + "a.style.setProperty('overflow','visible','important');a=a.parentElement;}"
@@ -178,10 +180,6 @@ public class FloatWindow {
         String url;
         LinearLayout chip;
         TextView chipTitle;
-        Bundle state;        // saved page state while the tab is frozen
-        long used;           // last time the tab was selected
-        int crashes;         // renderer crashes in a short time (to avoid reload loops)
-        long lastCrash;
     }
 
     final List<Tab> tabs = new ArrayList<>();
@@ -191,23 +189,6 @@ public class FloatWindow {
     LinearLayout tabRow, urlRow;
     EditText urlEdit;
 
-    // pinned sites row, menu panel (pins / bookmarks), file picker state, power saving
-    LinearLayout pinRow;
-    HorizontalScrollView pinScroll;
-    FrameLayout panel;
-    boolean pickerHidden, webPaused;
-    int pickX, pickY;
-    final JSONObject sess;          // saved session of this window (null for a fresh window)
-    final SharedPreferences bsp;    // pins + bookmarks
-    final Runnable limitTick = new Runnable() {
-        @Override
-        public void run() {
-            if (!rootAttached) return;
-            enforceTabLimit();
-            h.postDelayed(this, 30000);
-        }
-    };
-
     EditText editor;
     LinearLayout listBox;
     final Runnable saveTask = this::saveNow;
@@ -216,10 +197,7 @@ public class FloatWindow {
     // receives the real href of a long-pressed link (browser only)
     final Handler hrefHandler = new Handler(Looper.getMainLooper(), msg -> {
         String u = msg.getData().getString("url");
-        String src = msg.getData().getString("src");
-        if (u != null && !u.isEmpty()) {
-            showLinkBar(u, (src != null && src.startsWith("http")) ? src : null);
-        }
+        if (u != null && !u.isEmpty()) showLinkBar(u);
         return true;
     });
 
@@ -232,18 +210,12 @@ public class FloatWindow {
     MiniActionMode selMode;
 
     FloatWindow(FloatService svc, String type, String title, int index) {
-        this(svc, type, title, index, null);
-    }
-
-    FloatWindow(FloatService svc, String type, String title, int index, JSONObject sess) {
         this.svc = svc;
         this.wm = svc.wm;
         this.type = type;
         this.title = title;
         this.index = index;
-        this.sess = sess;
         this.sp = svc.getSharedPreferences("float_prefs", Context.MODE_PRIVATE);
-        this.bsp = svc.getSharedPreferences("float_browser", Context.MODE_PRIVATE);
         build();
     }
 
@@ -280,7 +252,11 @@ public class FloatWindow {
     }
 
     void updateLayout() {
-        if (rootAttached) wm.updateViewLayout(root, lp);
+        if (!rootAttached) return;
+        try {
+            wm.updateViewLayout(root, lp);
+        } catch (Exception ignored) {
+        }
     }
 
     // ---------- saved geometry / style (driven from the settings screen) ----------
@@ -346,10 +322,6 @@ public class FloatWindow {
     void build() {
         DisplayMetrics dm = svc.getResources().getDisplayMetrics();
         loadBubblePrefs();
-        if (sess != null && sess.has("bx")) {
-            bubX = sess.optInt("bx", bubX);
-            bubY = sess.optInt("by", bubY);
-        }
 
         int[] g = defaultGeom();
         if (sp.contains(type + ".w")) {
@@ -357,13 +329,6 @@ public class FloatWindow {
             g[3] = Math.min(sp.getInt(type + ".h", g[3]), dm.heightPixels);
             g[0] = Math.max(0, Math.min(sp.getInt(type + ".x", g[0]), dm.widthPixels - g[2]));
             g[1] = Math.max(0, Math.min(sp.getInt(type + ".y", g[1]), dm.heightPixels - dp(60)));
-        }
-
-        if (sess != null && sess.has("w")) {
-            g[2] = Math.max(dp(240), Math.min(sess.optInt("w", g[2]), dm.widthPixels));
-            g[3] = Math.max(dp(160), Math.min(sess.optInt("h", g[3]), dm.heightPixels));
-            g[0] = Math.max(0, Math.min(sess.optInt("x", g[0]), dm.widthPixels - g[2]));
-            g[1] = Math.max(0, Math.min(sess.optInt("y", g[1]), dm.heightPixels - dp(60)));
         }
 
         lp = new WindowManager.LayoutParams(g[2], g[3],
@@ -431,9 +396,6 @@ public class FloatWindow {
                         lp.y = sy + (int) (e.getRawY() - dy);
                         updateLayout();
                         return true;
-                    case MotionEvent.ACTION_UP:
-                        svc.scheduleSave();
-                        return true;
                 }
                 return false;
             }
@@ -477,6 +439,8 @@ public class FloatWindow {
         lpar.topMargin = dp(68);
         root.addView(linkBar, lpar);
 
+        if (type.equals(T_WEB)) buildSitePanel();
+
         // resize handle (bottom-right)
         rz = label("◢", 18, 0xFFBBBBBB);
         rz.setGravity(Gravity.CENTER);
@@ -498,9 +462,6 @@ public class FloatWindow {
                         lp.width = Math.max(dp(240), sw + (int) (e.getRawX() - dx));
                         lp.height = Math.max(dp(160), sh + (int) (e.getRawY() - dy));
                         updateLayout();
-                        return true;
-                    case MotionEvent.ACTION_UP:
-                        svc.scheduleSave();
                         return true;
                 }
                 return false;
@@ -566,6 +527,7 @@ public class FloatWindow {
         curTab = null;
         web = null;
         newTab(prev, true);   // the page you were on before the video, added BELOW the player
+        if (web != null) web.getSettings().setMediaPlaybackRequiresUserGesture(true);
         buildMini(player);
         player.wv.evaluateJavascript(JS_MINI_ON, null);
         h.removeCallbacks(miniWatch);
@@ -614,6 +576,7 @@ public class FloatWindow {
         }
         miniTab = null;
         miniOn = false;
+        if (curTab != null) curTab.wv.getSettings().setMediaPlaybackRequiresUserGesture(false);
     }
 
     void toggleMiniPlay() {
@@ -774,20 +737,15 @@ public class FloatWindow {
 
     // ---------- link bar (browser) ----------
     void showLinkBar(final String url) {
-        showLinkBar(url, null);
-    }
-
-    /** img != null -> the pressed thing is (or contains) an image that can be saved. */
-    void showLinkBar(final String url, final String img) {
         linkBar.removeAllViews();
-        TextView open = label("เปิดในแท็บใหม่", 13, Color.WHITE);
-        open.setPadding(dp(9), dp(10), dp(9), dp(10));
+        TextView open = label("เปิดในแท็บใหม่", 14, Color.WHITE);
+        open.setPadding(dp(14), dp(10), dp(14), dp(10));
         open.setOnClickListener(v -> {
             hideLinkBar();
             newTab(url, true);
         });
-        TextView copy = label("คัดลอกลิงก์", 13, Color.WHITE);
-        copy.setPadding(dp(9), dp(10), dp(9), dp(10));
+        TextView copy = label("คัดลอกลิงก์", 14, Color.WHITE);
+        copy.setPadding(dp(14), dp(10), dp(14), dp(10));
         copy.setOnClickListener(v -> {
             ClipboardManager cm = (ClipboardManager) svc.getSystemService(Context.CLIPBOARD_SERVICE);
             cm.setPrimaryClip(ClipData.newPlainText("link", url));
@@ -796,16 +754,6 @@ public class FloatWindow {
         });
         linkBar.addView(open);
         linkBar.addView(copy);
-        if (img != null) {
-            TextView save = label("บันทึกรูป", 13, Color.WHITE);
-            save.setPadding(dp(9), dp(10), dp(9), dp(10));
-            save.setOnClickListener(v -> {
-                hideLinkBar();
-                startDownload(img, web != null ? web.getSettings().getUserAgentString() : null,
-                        null, null);
-            });
-            linkBar.addView(save);
-        }
         linkBar.setVisibility(View.VISIBLE);
         h.removeCallbacks(hideLinkTask);
         h.postDelayed(hideLinkTask, 7000);
@@ -849,26 +797,14 @@ public class FloatWindow {
             tabRow.setOrientation(LinearLayout.HORIZONTAL);
             hs.addView(tabRow, new FrameLayout.LayoutParams(WRAP, MATCH));
             strip.addView(hs, new LinearLayout.LayoutParams(0, MATCH, 1f));
-            TextView menuBtn = btn("☰", v -> togglePanel());
-            menuBtn.setTextSize(15);
-            strip.addView(menuBtn, new LinearLayout.LayoutParams(dp(34), MATCH));
+            TextView starBtn = btn("★", v -> toggleSitePanel());
+            starBtn.setTextSize(15);
+            strip.addView(starBtn, new LinearLayout.LayoutParams(dp(34), MATCH));
             TextView urlBtn = btn("URL", v -> toggleUrlRow());
             urlBtn.setTextSize(11);
             strip.addView(urlBtn, new LinearLayout.LayoutParams(dp(40), MATCH));
             strip.addView(btn("+", v -> newTab(HOME, true)), new LinearLayout.LayoutParams(dp(34), MATCH));
             box.addView(strip, new LinearLayout.LayoutParams(MATCH, dp(30)));
-
-            // pinned sites: always one tap away
-            pinScroll = new HorizontalScrollView(svc);
-            pinScroll.setHorizontalScrollBarEnabled(false);
-            pinScroll.setBackgroundColor(0xFF232323);
-            pinRow = new LinearLayout(svc);
-            pinRow.setOrientation(LinearLayout.HORIZONTAL);
-            pinRow.setGravity(Gravity.CENTER_VERTICAL);
-            pinRow.setPadding(dp(4), 0, dp(4), 0);
-            pinScroll.addView(pinRow, new FrameLayout.LayoutParams(WRAP, MATCH));
-            box.addView(pinScroll, new LinearLayout.LayoutParams(MATCH, dp(28)));
-            refreshPins();
 
             urlRow = new LinearLayout(svc);
             urlRow.setOrientation(LinearLayout.HORIZONTAL);
@@ -897,17 +833,16 @@ public class FloatWindow {
             box.addView(urlRow, new LinearLayout.LayoutParams(MATCH, WRAP));
 
             box.addView(webHost, new LinearLayout.LayoutParams(MATCH, 0, 1f));
-            openStartTabs(startUrl);
+            newTab(startUrl, true);
             return box;
         }
-        openStartTabs(startUrl);
+        newTab(startUrl, true);
         return webHost;
     }
 
     Tab newTab(String url, boolean select) {
         final Tab t = new Tab();
         t.url = url;
-        t.used = SystemClock.uptimeMillis();
         t.wv = createWebView(t);
         t.wv.setVisibility(View.GONE);
         webHost.addView(t.wv, 0, new FrameLayout.LayoutParams(MATCH, MATCH));
@@ -940,20 +875,12 @@ public class FloatWindow {
     }
 
     void selectTab(Tab t) {
-        hidePanel();
-        if (t.wv == null) reviveTab(t);          // frozen tab -> rebuild it now
-        t.used = SystemClock.uptimeMillis();
         curTab = t;
         web = t.wv;
         for (Tab o : tabs) {
-            if (o.wv != null) o.wv.setVisibility(o == t ? View.VISIBLE : View.GONE);
-            if (o.chip != null) {
-                o.chip.setBackgroundColor(o == t ? 0xFF555555 : 0xFF2E2E2E);
-                o.chip.setAlpha(o.wv == null ? 0.55f : 1f);
-            }
+            o.wv.setVisibility(o == t ? View.VISIBLE : View.GONE);
+            if (o.chip != null) o.chip.setBackgroundColor(o == t ? 0xFF555555 : 0xFF2E2E2E);
         }
-        enforceTabLimit();
-        svc.scheduleSave();
     }
 
     void closeTab(Tab t) {
@@ -961,12 +888,9 @@ public class FloatWindow {
         if (i < 0) return;
         tabs.remove(t);
         if (tabRow != null && t.chip != null) tabRow.removeView(t.chip);
-        if (t.wv != null) {
-            webHost.removeView(t.wv);
-            t.wv.stopLoading();
-            t.wv.destroy();
-            t.wv = null;
-        }
+        webHost.removeView(t.wv);
+        t.wv.stopLoading();
+        t.wv.destroy();
         if (tabs.isEmpty()) {
             curTab = null;
             web = null;
@@ -974,137 +898,6 @@ public class FloatWindow {
         } else if (curTab == t) {
             selectTab(tabs.get(Math.min(i, tabs.size() - 1)));
         }
-        svc.scheduleSave();
-    }
-
-    // ---------- low-resource tabs: freeze background tabs, rebuild them on demand ----------
-
-    /** A tab that exists only as a chip + URL (restored session / frozen); no WebView, no RAM. */
-    Tab addDiscardedTab(String url, String ttl) {
-        Tab t = new Tab();
-        t.url = url;
-        if (ttl != null && !ttl.isEmpty()) t.title = ttl;
-        tabs.add(t);
-        if (tabRow != null) {
-            addChip(t);
-            t.chip.setBackgroundColor(0xFF2E2E2E);
-            t.chip.setAlpha(0.55f);
-        }
-        return t;
-    }
-
-    /** Build the WebView of a frozen tab again (page state is restored when possible). */
-    void reviveTab(Tab t) {
-        if (t.wv != null || webHost == null) return;
-        t.wv = createWebView(t);
-        t.wv.setVisibility(View.GONE);
-        webHost.addView(t.wv, 0, new FrameLayout.LayoutParams(MATCH, MATCH));
-        boolean ok = false;
-        if (t.state != null) {
-            try {
-                ok = t.wv.restoreState(t.state) != null;
-            } catch (Exception ignored) {
-            }
-        }
-        t.state = null;
-        if (!ok) t.wv.loadUrl((t.url != null && !t.url.isEmpty()) ? t.url : homeUrl());
-    }
-
-    /** Free the memory of a tab but keep its chip, URL and page state. */
-    void discardTab(Tab t, boolean force) {
-        if (t.wv == null || t == miniTab) return;
-        if (t == curTab && !force) return;
-        Bundle b = new Bundle();
-        try {
-            t.wv.saveState(b);
-            t.state = b;
-        } catch (Exception e) {
-            t.state = null;
-        }
-        try {
-            String u = t.wv.getUrl();
-            if (u != null && u.startsWith("http")) t.url = u;
-            webHost.removeView(t.wv);
-            t.wv.stopLoading();
-            t.wv.destroy();
-        } catch (Exception ignored) {
-        }
-        t.wv = null;
-        if (t == curTab) web = null;
-        if (t.chip != null) t.chip.setAlpha(0.55f);
-    }
-
-    /** Keep at most MAX_LIVE_TABS WebViews alive; the least recently used ones are frozen. */
-    void enforceTabLimit() {
-        if (!type.equals(T_WEB)) return;
-        long now = SystemClock.uptimeMillis();
-        while (true) {
-            int live = 0;
-            Tab oldest = null;
-            for (Tab o : tabs) {
-                if (o.wv == null) continue;
-                live++;
-                if (o == curTab || o == miniTab) continue;
-                if (now - o.used < TAB_GRACE_MS) continue;
-                if (oldest == null || o.used < oldest.used) oldest = o;
-            }
-            if (live <= MAX_LIVE_TABS || oldest == null) return;
-            discardTab(oldest, false);
-        }
-    }
-
-    /** The system is short on memory: freeze every page that is not on screen. */
-    void trimMemory(boolean critical) {
-        if (webHost == null) return;
-        for (Tab t : new ArrayList<>(tabs)) {
-            if (t == curTab || t == miniTab) continue;
-            discardTab(t, false);
-        }
-        // a minimized window (not YouTube, which keeps playing) can free its page too
-        if (critical && minimized && !type.equals(T_YT) && curTab != null) {
-            discardTab(curTab, true);
-        }
-    }
-
-    /** Minimized (non-YouTube) windows stop their pages; they continue when restored. */
-    void pauseWebs(boolean pause) {
-        if (type.equals(T_YT) || webPaused == pause) return;
-        webPaused = pause;
-        for (Tab t : tabs) {
-            if (t.wv == null) continue;
-            try {
-                if (pause) t.wv.onPause();
-                else t.wv.onResume();
-            } catch (Exception ignored) {
-            }
-        }
-    }
-
-    boolean hasWeb() {
-        return webHost != null;
-    }
-
-    /** Opens the tabs of a saved session (only the current one is loaded), or the start page. */
-    void openStartTabs(String startUrl) {
-        JSONArray arr = sess != null ? sess.optJSONArray("tabs") : null;
-        if (arr == null || arr.length() == 0) {
-            newTab(startUrl, true);
-            return;
-        }
-        int cur = Math.max(0, Math.min(sess.optInt("cur", 0), arr.length() - 1));
-        for (int i = 0; i < arr.length(); i++) {
-            JSONObject o = arr.optJSONObject(i);
-            if (o == null) continue;
-            String u = o.optString("u", "");
-            String ti = o.optString("t", "");
-            if (!type.equals(T_WEB)) {          // single-page windows: just reopen their page
-                newTab(u.isEmpty() ? startUrl : u, true);
-                return;
-            }
-            if (i == cur) newTab(u.isEmpty() ? startUrl : u, true);
-            else addDiscardedTab(u.isEmpty() ? homeUrl() : u, ti);
-        }
-        if (tabs.isEmpty()) newTab(startUrl, true);
     }
 
     WebView createWebView(final Tab t) {
@@ -1120,13 +913,6 @@ public class FloatWindow {
             w.setOnLongClickListener(v -> {
                 WebView wv = (WebView) v;
                 int tp = wv.getHitTestResult().getType();
-                if (tp == WebView.HitTestResult.IMAGE_TYPE) {
-                    String ex = wv.getHitTestResult().getExtra();
-                    if (ex != null && ex.startsWith("http")) {
-                        showLinkBar(ex, ex);
-                        return true;
-                    }
-                }
                 if (tp == WebView.HitTestResult.SRC_ANCHOR_TYPE
                         || tp == WebView.HitTestResult.SRC_IMAGE_ANCHOR_TYPE) {
                     wv.requestFocusNodeHref(Message.obtain(hrefHandler));
@@ -1138,7 +924,8 @@ public class FloatWindow {
         CookieManager cm = CookieManager.getInstance();
         cm.setAcceptCookie(true);
         cm.setAcceptThirdPartyCookies(w, true);
-        w.setDownloadListener((du, ua, cd, mime, len) -> startDownload(du, ua, cd, mime));
+        w.addJavascriptInterface(new FWBridge(), "FWBridge");
+        w.setDownloadListener((durl, ua, cd, mime, len) -> handleDownload(w, durl, ua, cd, mime));
 
         w.setWebViewClient(new WebViewClient() {
             @Override
@@ -1167,11 +954,6 @@ public class FloatWindow {
             @Override
             public void onPageFinished(WebView v, String u) {
                 if (type.equals(T_YT)) v.evaluateJavascript(JS_NOHIDE, null);
-                if (t.wv == v) {
-                    String cu = v.getUrl();
-                    if (cu != null && cu.startsWith("http")) t.url = cu;
-                    svc.scheduleSave();
-                }
             }
 
             // The web renderer can die (e.g. Facebook's endless feed eats memory). Without this
@@ -1211,11 +993,10 @@ public class FloatWindow {
                 if (type.equals(T_WEB)) h.post(() -> closeTab(t));
             }
 
-            // <input type=file> on a page -> system file picker
             @Override
             public boolean onShowFileChooser(WebView v, ValueCallback<Uri[]> cb,
-                                             FileChooserParams params) {
-                return pickFile(cb, params);
+                                             WebChromeClient.FileChooserParams fcp) {
+                return FilePickActivity.start(svc, cb, fcp);
             }
 
             @Override
@@ -1229,6 +1010,197 @@ public class FloatWindow {
             }
         });
         return w;
+    }
+
+    // ---------- downloads ----------
+    long blobDeadline;
+
+    /** Receives the bytes of a blob: download from the page (only accepted right after we asked). */
+    class FWBridge {
+        @JavascriptInterface
+        public void saveBlob(String b64, String mime, String name) {
+            if (System.currentTimeMillis() > blobDeadline) return;
+            try {
+                saveBytes(Base64.decode(b64, Base64.DEFAULT), mime, name);
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
+    void toast(final String msg) {
+        h.post(() -> Toast.makeText(svc, msg, Toast.LENGTH_SHORT).show());
+    }
+
+    void handleDownload(WebView v, String url, String ua, String cd, String mime) {
+        try {
+            String name = URLUtil.guessFileName(url, cd, mime);
+            if (url.startsWith("blob:")) {
+                blobDeadline = System.currentTimeMillis() + 60000;
+                String js = "(function(u,fn){var x=new XMLHttpRequest();x.open('GET',u,true);"
+                        + "x.responseType='blob';x.onload=function(){var r=new FileReader();"
+                        + "r.onloadend=function(){var d=r.result;var i=d.indexOf(',');"
+                        + "FWBridge.saveBlob(d.substring(i+1),(x.response&&x.response.type)||"
+                        + "'application/octet-stream',fn);};r.readAsDataURL(x.response);};x.send();})("
+                        + JSONObject.quote(url) + "," + JSONObject.quote(name) + ")";
+                v.evaluateJavascript(js, null);
+                toast("กำลังดาวน์โหลด: " + name);
+                return;
+            }
+            if (url.startsWith("data:")) {
+                int c = url.indexOf(',');
+                if (c > 0) {
+                    String meta = url.substring(5, c);
+                    byte[] data = meta.contains("base64")
+                            ? Base64.decode(url.substring(c + 1), Base64.DEFAULT)
+                            : Uri.decode(url.substring(c + 1)).getBytes(StandardCharsets.UTF_8);
+                    String m = meta.split("[;,]")[0];
+                    saveBytes(data, m.isEmpty() ? "application/octet-stream" : m, name);
+                }
+                return;
+            }
+            DownloadManager.Request req = new DownloadManager.Request(Uri.parse(url));
+            if (mime != null && !mime.isEmpty()) req.setMimeType(mime);
+            String cookie = CookieManager.getInstance().getCookie(url);
+            if (cookie != null) req.addRequestHeader("Cookie", cookie);
+            if (ua != null) req.addRequestHeader("User-Agent", ua);
+            req.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
+            req.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, name);
+            ((DownloadManager) svc.getSystemService(Context.DOWNLOAD_SERVICE)).enqueue(req);
+            toast("กำลังดาวน์โหลด: " + name);
+        } catch (Exception e) {
+            toast("ดาวน์โหลดไม่สำเร็จ");
+        }
+    }
+
+    void saveBytes(byte[] data, String mime, String name) {
+        try {
+            if (Build.VERSION.SDK_INT >= 29) {
+                ContentValues cv = new ContentValues();
+                cv.put(MediaStore.Downloads.DISPLAY_NAME, name);
+                cv.put(MediaStore.Downloads.MIME_TYPE, mime);
+                cv.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
+                Uri uri = svc.getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv);
+                try (OutputStream os = svc.getContentResolver().openOutputStream(uri)) {
+                    os.write(data);
+                }
+            } else {
+                File dir = svc.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
+                Files.write(new File(dir, name).toPath(), data);
+            }
+            toast("บันทึกไฟล์แล้ว: " + name);
+        } catch (Exception e) {
+            toast("บันทึกไฟล์ไม่สำเร็จ");
+        }
+    }
+
+    // ---------- pinned sites & bookmarks panel (browser) ----------
+    ScrollView sitePanel;
+    LinearLayout sitePanelList;
+
+    void buildSitePanel() {
+        sitePanel = new ScrollView(svc);
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(0xF2262626);
+        bg.setCornerRadius(dp(8));
+        bg.setStroke(dp(1), 0xFF555555);
+        sitePanel.setBackground(bg);
+        sitePanelList = new LinearLayout(svc);
+        sitePanelList.setOrientation(LinearLayout.VERTICAL);
+        sitePanel.addView(sitePanelList, new FrameLayout.LayoutParams(MATCH, WRAP));
+        sitePanel.setVisibility(View.GONE);
+        FrameLayout.LayoutParams p = new FrameLayout.LayoutParams(MATCH, WRAP, Gravity.TOP);
+        p.setMargins(dp(6), dp(66), dp(6), dp(38));
+        root.addView(sitePanel, p);
+    }
+
+    void toggleSitePanel() {
+        if (sitePanel == null) return;
+        if (sitePanel.getVisibility() == View.VISIBLE) {
+            sitePanel.setVisibility(View.GONE);
+        } else {
+            refreshSitePanel();
+            sitePanel.setVisibility(View.VISIBLE);
+        }
+    }
+
+    TextView panelRow(String t, View.OnClickListener l) {
+        TextView tv = label(t, 13, Color.WHITE);
+        tv.setPadding(dp(12), dp(10), dp(12), dp(10));
+        tv.setOnClickListener(l);
+        return tv;
+    }
+
+    void refreshSitePanel() {
+        sitePanelList.removeAllViews();
+        LinearLayout row = new LinearLayout(svc);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.addView(panelRow("＋ บุ๊กมาร์กหน้านี้", v -> addCurrent("bookmarks")),
+                new LinearLayout.LayoutParams(0, WRAP, 1f));
+        row.addView(panelRow("＋ ปักหมุดหน้านี้", v -> addCurrent("pins")),
+                new LinearLayout.LayoutParams(0, WRAP, 1f));
+        sitePanelList.addView(row, new LinearLayout.LayoutParams(MATCH, WRAP));
+        addSection("ปักหมุด (เว็บที่ใช้บ่อย)", "pins");
+        addSection("บุ๊กมาร์ก", "bookmarks");
+        sitePanelList.addView(panelRow("เปิดโฟลเดอร์ดาวน์โหลด", v -> openDownloads()));
+    }
+
+    void addSection(String head, final String key) {
+        TextView hd = label(head, 12, 0xFF9AA0A6);
+        hd.setPadding(dp(12), dp(8), dp(12), dp(2));
+        sitePanelList.addView(hd);
+        List<String[]> items = SiteStore.load(sp, key);
+        if (items.isEmpty()) {
+            TextView none = label("ยังไม่มี", 12, 0xFF777777);
+            none.setPadding(dp(12), dp(4), dp(12), dp(6));
+            sitePanelList.addView(none);
+            return;
+        }
+        for (final String[] it : items) {
+            LinearLayout r = new LinearLayout(svc);
+            r.setOrientation(LinearLayout.HORIZONTAL);
+            r.setGravity(Gravity.CENTER_VERTICAL);
+            TextView t = label(it[0].isEmpty() ? it[1] : it[0], 14, Color.WHITE);
+            t.setSingleLine(true);
+            t.setEllipsize(TextUtils.TruncateAt.END);
+            t.setPadding(dp(12), dp(9), dp(6), dp(9));
+            t.setOnClickListener(v -> {
+                if (web != null) web.loadUrl(it[1]);
+                sitePanel.setVisibility(View.GONE);
+            });
+            TextView x = btn("✕", v -> {
+                SiteStore.remove(sp, key, it[1]);
+                refreshSitePanel();
+            });
+            x.setTextSize(13);
+            r.addView(t, new LinearLayout.LayoutParams(0, WRAP, 1f));
+            r.addView(x, new LinearLayout.LayoutParams(dp(36), dp(36)));
+            sitePanelList.addView(r, new LinearLayout.LayoutParams(MATCH, WRAP));
+        }
+    }
+
+    void addCurrent(String key) {
+        if (web == null) return;
+        String u = web.getUrl();
+        if (u == null || !u.startsWith("http")) {
+            toast("เพิ่มหน้านี้ไม่ได้");
+            return;
+        }
+        String t = web.getTitle();
+        if (t == null || t.isEmpty()) t = u;
+        SiteStore.add(sp, key, t, u);
+        toast("บันทึกแล้ว");
+        refreshSitePanel();
+    }
+
+    void openDownloads() {
+        sitePanel.setVisibility(View.GONE);
+        try {
+            Intent i = new Intent(DownloadManager.ACTION_VIEW_DOWNLOADS);
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            svc.startActivity(i);
+        } catch (Exception e) {
+            toast("เปิดโฟลเดอร์ไม่ได้");
+        }
     }
 
     // ---------- home page per type, URL entry, crash recovery ----------
@@ -1274,16 +1246,7 @@ public class FloatWindow {
     }
 
     void recreateTab(Tab t) {
-        if (!tabs.contains(t) || webHost == null || t.wv == null) return;
-        // a page that kills its renderer again and again: stop reloading it, go home instead
-        long now = SystemClock.uptimeMillis();
-        t.crashes = (now - t.lastCrash < 20000) ? t.crashes + 1 : 1;
-        t.lastCrash = now;
-        boolean loop = t.crashes >= 3;
-        if (loop) {
-            t.crashes = 0;
-            t.url = homeUrl();
-        }
+        if (!tabs.contains(t) || webHost == null) return;
         boolean wasCurrent = (curTab == t);
         webHost.removeView(t.wv);
         try {
@@ -1295,8 +1258,7 @@ public class FloatWindow {
         t.wv.setVisibility(wasCurrent ? View.VISIBLE : View.GONE);
         if (wasCurrent) web = t.wv;
         t.wv.loadUrl((t.url != null && !t.url.isEmpty()) ? t.url : homeUrl());
-        Toast.makeText(svc, loop ? "หน้านี้ทำให้ค้างซ้ำ เปิดหน้าแรกแทน"
-                : "หน้าเว็บค้าง รีโหลดให้อัตโนมัติแล้ว", Toast.LENGTH_SHORT).show();
+        Toast.makeText(svc, "หน้าเว็บค้าง รีโหลดให้อัตโนมัติแล้ว", Toast.LENGTH_SHORT).show();
     }
 
     // ---------- fullscreen video (exit with the player's own button or Back) ----------
@@ -1523,339 +1485,11 @@ public class FloatWindow {
         listBox.addView(all, new LinearLayout.LayoutParams(MATCH, WRAP));
     }
 
-    // ---------- small helpers ----------
-    void toast(String s) {
-        Toast.makeText(svc, s, Toast.LENGTH_SHORT).show();
-    }
-
-    static String hostOf(String u) {
-        try {
-            String host = Uri.parse(u).getHost();
-            return host == null ? String.valueOf(u) : host.replaceFirst("^www\\.", "");
-        } catch (Exception e) {
-            return String.valueOf(u);
-        }
-    }
-
-    String curUrl() {
-        String u = web != null ? web.getUrl() : null;
-        if (u == null && curTab != null) u = curTab.url;
-        return u;
-    }
-
-    String curTitle() {
-        String t = curTab != null ? curTab.title : null;
-        if (t == null || t.isEmpty() || t.equals("แท็บใหม่")) t = hostOf(curUrl());
-        return t;
-    }
-
-    // ---------- browser menu: pinned sites, bookmarks, downloads ----------
-    boolean panelOpen() {
-        return panel != null && panel.getVisibility() == View.VISIBLE;
-    }
-
-    void hidePanel() {
-        if (panel != null) panel.setVisibility(View.GONE);
-    }
-
-    void togglePanel() {
-        if (panelOpen()) hidePanel();
-        else showPanel();
-    }
-
-    TextView panelBtn(String t, View.OnClickListener l) {
-        TextView b = label(t, 12, Color.WHITE);
-        b.setGravity(Gravity.CENTER);
-        b.setSingleLine(true);
-        GradientDrawable bg = new GradientDrawable();
-        bg.setColor(0xFF3A3A3A);
-        bg.setCornerRadius(dp(8));
-        b.setBackground(bg);
-        b.setOnClickListener(l);
-        return b;
-    }
-
-    void showPanel() {
-        if (webHost == null) return;
-        if (panel == null) {
-            panel = new FrameLayout(svc);
-            panel.setBackgroundColor(0xFF1E1E1E);
-            panel.setClickable(true);     // do not let touches fall through to the page below
-            webHost.addView(panel, new FrameLayout.LayoutParams(MATCH, MATCH));
-        }
-        panel.removeAllViews();
-
-        ScrollView sv = new ScrollView(svc);
-        LinearLayout box = new LinearLayout(svc);
-        box.setOrientation(LinearLayout.VERTICAL);
-        box.setPadding(dp(8), dp(4), dp(8), dp(12));
-        sv.addView(box, new FrameLayout.LayoutParams(MATCH, WRAP));
-        panel.addView(sv, new FrameLayout.LayoutParams(MATCH, MATCH));
-
-        LinearLayout head = new LinearLayout(svc);
-        head.setOrientation(LinearLayout.HORIZONTAL);
-        head.setGravity(Gravity.CENTER_VERTICAL);
-        TextView ttl = label("เมนูเบราว์เซอร์", 14, Color.WHITE);
-        ttl.setPadding(dp(4), 0, 0, 0);
-        head.addView(ttl, new LinearLayout.LayoutParams(0, WRAP, 1f));
-        head.addView(btn("✕", v -> hidePanel()), new LinearLayout.LayoutParams(dp(40), dp(36)));
-        box.addView(head, new LinearLayout.LayoutParams(MATCH, WRAP));
-
-        LinearLayout acts = new LinearLayout(svc);
-        acts.setOrientation(LinearLayout.HORIZONTAL);
-        String[] names = {"📌 ปักหมุด", "★ บุ๊กมาร์ก", "⬇ ไฟล์ที่โหลด"};
-        View.OnClickListener[] fns = {
-                v -> saveSite("pins"),
-                v -> saveSite("bookmarks"),
-                v -> openDownloads()
-        };
-        for (int i = 0; i < names.length; i++) {
-            LinearLayout.LayoutParams pl = new LinearLayout.LayoutParams(0, dp(40), 1f);
-            pl.setMargins(dp(2), 0, dp(2), 0);
-            acts.addView(panelBtn(names[i], fns[i]), pl);
-        }
-        box.addView(acts, new LinearLayout.LayoutParams(MATCH, WRAP));
-
-        addSection(box, "หมุดที่ปักไว้", "pins", true);
-        addSection(box, "บุ๊กมาร์ก", "bookmarks", false);
-
-        panel.setVisibility(View.VISIBLE);
-        panel.bringToFront();
-    }
-
-    void addSection(LinearLayout box, String title, final String key, final boolean isPin) {
-        List<SiteStore.Item> items = SiteStore.load(bsp, key);
-        TextView hd = label(title + " (" + items.size() + ")", 13, 0xFF9DB7FF);
-        hd.setPadding(dp(4), dp(14), 0, dp(4));
-        box.addView(hd);
-        if (items.isEmpty()) {
-            TextView e = label(isPin ? "ยังไม่มีหมุด เปิดเว็บที่ต้องการแล้วกด 📌"
-                    : "ยังไม่มีบุ๊กมาร์ก เปิดเว็บที่ต้องการแล้วกด ★", 12, 0xFF888888);
-            e.setPadding(dp(4), dp(4), 0, dp(4));
-            box.addView(e);
-            return;
-        }
-        for (final SiteStore.Item it : items) {
-            LinearLayout row = new LinearLayout(svc);
-            row.setOrientation(LinearLayout.HORIZONTAL);
-            row.setGravity(Gravity.CENTER_VERTICAL);
-
-            LinearLayout txt = new LinearLayout(svc);
-            txt.setOrientation(LinearLayout.VERTICAL);
-            txt.setPadding(dp(6), dp(6), dp(6), dp(6));
-            TextView t1 = label(it.title, 14, Color.WHITE);
-            t1.setSingleLine(true);
-            t1.setEllipsize(TextUtils.TruncateAt.END);
-            TextView t2 = label(hostOf(it.url), 11, 0xFF999999);
-            t2.setSingleLine(true);
-            t2.setEllipsize(TextUtils.TruncateAt.END);
-            txt.addView(t1);
-            txt.addView(t2);
-            txt.setOnClickListener(v -> openSite(it.url));
-            row.addView(txt, new LinearLayout.LayoutParams(0, WRAP, 1f));
-
-            TextView del = btn("✕", v -> {
-                SiteStore.remove(bsp, key, it.url);
-                if (isPin) refreshPins();
-                h.post(this::showPanel);
-            });
-            del.setTextColor(0xFFFF8A8A);
-            row.addView(del, new LinearLayout.LayoutParams(dp(40), dp(40)));
-            box.addView(row, new LinearLayout.LayoutParams(MATCH, WRAP));
-        }
-    }
-
-    /** Pin or bookmark the page that is open now. */
-    void saveSite(String key) {
-        boolean pin = key.equals("pins");
-        String u = curUrl();
-        if (u == null || !u.startsWith("http")) {
-            toast("หน้านี้ยังบันทึกไม่ได้");
-            return;
-        }
-        int r = SiteStore.add(bsp, key, curTitle(), u, pin ? 12 : 300);
-        if (r == SiteStore.ADDED) toast(pin ? "ปักหมุดแล้ว" : "บันทึกบุ๊กมาร์กแล้ว");
-        else if (r == SiteStore.DUPLICATE) toast(pin ? "ปักหมุดไว้แล้ว" : "มีบุ๊กมาร์กนี้แล้ว");
-        else toast(pin ? "ปักหมุดได้สูงสุด 12 เว็บ" : "บุ๊กมาร์กเต็มแล้ว");
-        if (pin) refreshPins();
-        showPanel();
-    }
-
-    /** The row of pinned sites under the tab strip (hidden when there are none). */
-    void refreshPins() {
-        if (pinRow == null) return;
-        pinRow.removeAllViews();
-        List<SiteStore.Item> items = SiteStore.load(bsp, "pins");
-        pinScroll.setVisibility(items.isEmpty() ? View.GONE : View.VISIBLE);
-        for (final SiteStore.Item it : items) {
-            TextView c = label(it.title, 12, Color.WHITE);
-            c.setSingleLine(true);
-            c.setEllipsize(TextUtils.TruncateAt.END);
-            c.setMaxWidth(dp(110));
-            c.setGravity(Gravity.CENTER);
-            c.setPadding(dp(10), 0, dp(10), 0);
-            GradientDrawable bg = new GradientDrawable();
-            bg.setColor(0xFF3A3A3A);
-            bg.setCornerRadius(dp(11));
-            c.setBackground(bg);
-            c.setOnClickListener(v -> openSite(it.url));
-            LinearLayout.LayoutParams cp = new LinearLayout.LayoutParams(WRAP, dp(22));
-            cp.setMargins(dp(2), 0, dp(2), 0);
-            pinRow.addView(c, cp);
-        }
-    }
-
-    /** Open a pinned/bookmarked site: jump to its tab if already open, else a new tab. */
-    void openSite(String url) {
-        hidePanel();
-        for (Tab t : tabs) {
-            if (SiteStore.same(url, t.url)) {
-                selectTab(t);
-                return;
-            }
-        }
-        newTab(url, true);
-    }
-
-    // ---------- downloads ----------
-    void startDownload(String url, String ua, String cd, String mime) {
-        try {
-            if (url == null || !(url.startsWith("http://") || url.startsWith("https://"))) {
-                toast("ลิงก์แบบนี้ (blob/data) ยังโหลดตรง ๆ ไม่ได้");
-                return;
-            }
-            String name = URLUtil.guessFileName(url, cd, mime);
-            DownloadManager.Request r = new DownloadManager.Request(Uri.parse(url));
-            if (mime != null && !mime.isEmpty()) r.setMimeType(mime);
-            String ck = CookieManager.getInstance().getCookie(url);
-            if (ck != null) r.addRequestHeader("Cookie", ck);
-            if (ua != null) r.addRequestHeader("User-Agent", ua);
-            String ref = web != null ? web.getUrl() : null;
-            if (ref != null && ref.startsWith("http")) r.addRequestHeader("Referer", ref);
-            r.setTitle(name);
-            r.setDescription(hostOf(url));
-            r.setNotificationVisibility(
-                    DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
-            r.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, name);
-            DownloadManager dm = (DownloadManager) svc.getSystemService(Context.DOWNLOAD_SERVICE);
-            dm.enqueue(r);
-            toast("เริ่มดาวน์โหลด: " + name);
-        } catch (Exception e) {
-            toast("โหลดไฟล์ไม่ได้: " + e.getMessage());
-        }
-    }
-
-    /** Opens the system Downloads list (the window goes to its bubble so it is not in the way). */
-    void openDownloads() {
-        try {
-            Intent i = new Intent(DownloadManager.ACTION_VIEW_DOWNLOADS);
-            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-            hidePanel();
-            minimizeToBubble();
-            svc.startActivity(i);
-        } catch (Exception e) {
-            toast("เปิดรายการดาวน์โหลดไม่ได้");
-        }
-    }
-
-    // ---------- upload (a page asks for a file) ----------
-    boolean pickFile(ValueCallback<Uri[]> cb, WebChromeClient.FileChooserParams p) {
-        try {
-            FilePickerActivity.cancelPending();      // an older request is still open: end it
-            FilePickerActivity.pending = cb;
-            FilePickerActivity.onDone = this::showAfterPicker;
-            Intent i = new Intent(svc, FilePickerActivity.class);
-            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-            i.putExtra("accept", p != null ? p.getAcceptTypes() : null);
-            i.putExtra("multiple", p != null
-                    && p.getMode() == WebChromeClient.FileChooserParams.MODE_OPEN_MULTIPLE);
-            hideForPicker();
-            svc.startActivity(i);
-        } catch (Exception e) {
-            FilePickerActivity.cancelPending();      // answers the page with "no file"
-            showAfterPicker();
-            toast("เปิดตัวเลือกไฟล์ไม่ได้");
-        }
-        return true;
-    }
-
-    /** The window steps aside while the system file picker is on screen. */
-    void hideForPicker() {
-        if (minimized || !rootAttached || pickerHidden) return;
-        pickerHidden = true;
-        pickX = lp.x;
-        pickY = lp.y;
-        lp.flags |= WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-                | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS;
-        lp.x = -30000;
-        lp.y = -30000;
-        updateLayout();
-    }
-
-    void showAfterPicker() {
-        if (!pickerHidden) return;
-        pickerHidden = false;
-        if (minimized || !rootAttached) return;
-        lp.flags = FLAGS;
-        lp.x = pickX;
-        lp.y = pickY;
-        updateLayout();
-    }
-
-    // ---------- saved session (windows come back if the system kills the app) ----------
-    JSONObject toJson() throws org.json.JSONException {
-        JSONObject o = new JSONObject();
-        o.put("type", type);
-        int x = lp.x, y = lp.y, w = lp.width, hh = lp.height;
-        if (customView != null) {
-            x = prevX;
-            y = prevY;
-            w = prevW;
-            hh = prevH;
-        }
-        if (minimized) {
-            x = restX;
-            y = restY;
-        }
-        if (pickerHidden) {
-            x = pickX;
-            y = pickY;
-        }
-        o.put("x", x);
-        o.put("y", y);
-        o.put("w", w);
-        o.put("h", hh);
-        o.put("minimized", minimized);
-        o.put("bx", bubX);
-        o.put("by", bubY);
-        JSONArray ta = new JSONArray();
-        int cur = 0, i = 0;
-        for (Tab t : tabs) {
-            String u = t.url;
-            if (t.wv != null) {
-                String cu = t.wv.getUrl();
-                if (cu != null && cu.startsWith("http")) u = cu;
-            }
-            if (u == null || !u.startsWith("http")) u = homeUrl();
-            JSONObject to = new JSONObject();
-            to.put("u", u);
-            to.put("t", t.title == null ? "" : t.title);
-            ta.put(to);
-            if (t == curTab) cur = i;
-            i++;
-        }
-        o.put("tabs", ta);
-        o.put("cur", cur);
-        return o;
-    }
-
     // ---------- show / minimize / restore / close ----------
     void show() {
         lp.flags = FLAGS;
         wm.addView(root, lp);
         rootAttached = true;
-        h.postDelayed(limitTick, 30000);
     }
 
     /**
@@ -1865,6 +1499,18 @@ public class FloatWindow {
      */
     void minimize() {
         minimizeToBubble();
+    }
+
+    /** Facebook / Translate do nothing useful while minimized, so rest them (YouTube & browser keep running). */
+    void pauseWebIfIdle() {
+        if (type.equals(T_FB) || type.equals(T_TR)) {
+            for (Tab t : tabs) t.wv.onPause();
+        }
+    }
+
+    void resumeWeb() {
+        for (Tab t : tabs) t.wv.onResume();
+        if (miniTab != null) miniTab.wv.onResume();
     }
 
     void prepareMinimize() {
@@ -1887,25 +1533,20 @@ public class FloatWindow {
         lp.y = -30000;
         updateLayout();
         showBubble();
+        pauseWebIfIdle();
         svc.notifyChanged();
-        pauseWebs(true);
-        svc.updatePower();
-        svc.scheduleSave();
     }
 
     void restore() {
         if (!minimized) return;
         hideBubble();
         minimized = false;
+        resumeWeb();
         lp.flags = FLAGS;
         lp.x = restX;
         lp.y = restY;
         updateLayout();
         svc.notifyChanged();
-        pauseWebs(false);
-        if (curTab != null && curTab.wv == null) selectTab(curTab);   // rebuild a frozen page
-        svc.updatePower();
-        svc.scheduleSave();
     }
 
     void bringToFront() {
@@ -1927,18 +1568,16 @@ public class FloatWindow {
         customView = null;
         customCb = null;
         if (rootAttached) {
-            wm.removeView(root);
+            try {
+                wm.removeView(root);
+            } catch (Exception ignored) {
+            }
             rootAttached = false;
         }
         hideBubble();
         if (webHost != null) closeMini();
         if (webHost != null) webHost.removeAllViews();
-        if (pickerHidden) {
-            pickerHidden = false;
-            FilePickerActivity.cancelPending();
-        }
         for (Tab t : new ArrayList<>(tabs)) {
-            if (t.wv == null) continue;
             t.wv.stopLoading();
             t.wv.destroy();
         }
@@ -2030,7 +1669,10 @@ public class FloatWindow {
 
     void hideBubble() {
         if (bubbleAttached) {
-            wm.removeView(bubble);
+            try {
+                wm.removeView(bubble);
+            } catch (Exception ignored) {
+            }
             bubbleAttached = false;
         }
     }
@@ -2072,10 +1714,6 @@ public class FloatWindow {
         @Override
         public boolean dispatchKeyEvent(KeyEvent e) {
             if (e.getKeyCode() == KeyEvent.KEYCODE_BACK) {
-                if (panelOpen()) {
-                    if (e.getAction() == KeyEvent.ACTION_UP) hidePanel();
-                    return true;
-                }
                 if (customView != null) {
                     if (e.getAction() == KeyEvent.ACTION_UP) exitFull();
                     return true;

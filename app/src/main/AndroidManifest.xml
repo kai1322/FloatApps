@@ -6,9 +6,7 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-    <uses-permission
-        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
-        android:maxSdkVersion="28" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
     <application
         android:allowBackup="false"
@@ -30,12 +28,10 @@
             android:exported="false"
             android:label="ตั้งค่า" />
 
-        <!-- invisible helper that shows the system file picker for web uploads -->
         <activity
-            android:name=".FilePickerActivity"
+            android:name=".FilePickActivity"
             android:exported="false"
             android:excludeFromRecents="true"
-            android:taskAffinity=""
             android:theme="@android:style/Theme.Translucent.NoTitleBar" />
 
         <service

@@ -8,84 +8,52 @@ import org.json.JSONObject;
 import java.util.ArrayList;
 import java.util.List;
 
-/** Tiny persistent list of sites (used for both pinned sites and bookmarks). */
+/** Pinned sites and bookmarks, stored as a small JSON list in SharedPreferences. */
 final class SiteStore {
+    private SiteStore() { }
 
-    static final int ADDED = 1, DUPLICATE = 0, FULL = -1;
-
-    static class Item {
-        final String title;
-        final String url;
-
-        Item(String title, String url) {
-            this.title = title;
-            this.url = url;
-        }
-    }
-
-    private SiteStore() {
-    }
-
-    /** Compare two URLs ignoring a trailing slash and the #fragment. */
-    static boolean same(String a, String b) {
-        return norm(a).equals(norm(b));
-    }
-
-    private static String norm(String u) {
-        if (u == null) return "";
-        int i = u.indexOf('#');
-        if (i >= 0) u = u.substring(0, i);
-        while (u.endsWith("/")) u = u.substring(0, u.length() - 1);
-        return u;
-    }
-
-    static List<Item> load(SharedPreferences sp, String key) {
-        List<Item> out = new ArrayList<>();
+    static List<String[]> load(SharedPreferences sp, String key) {
+        List<String[]> out = new ArrayList<>();
         try {
             JSONArray a = new JSONArray(sp.getString(key, "[]"));
             for (int i = 0; i < a.length(); i++) {
-                JSONObject o = a.optJSONObject(i);
-                if (o == null) continue;
-                String u = o.optString("u", "");
-                if (u.isEmpty()) continue;
-                out.add(new Item(o.optString("t", u), u));
+                JSONObject o = a.getJSONObject(i);
+                out.add(new String[]{o.optString("t"), o.optString("u")});
             }
         } catch (Exception ignored) {
         }
         return out;
     }
 
-    private static void write(SharedPreferences sp, String key, List<Item> items) {
-        try {
-            JSONArray a = new JSONArray();
-            for (Item it : items) {
+    private static void save(SharedPreferences sp, String key, List<String[]> list) {
+        JSONArray a = new JSONArray();
+        for (String[] p : list) {
+            try {
                 JSONObject o = new JSONObject();
-                o.put("t", it.title);
-                o.put("u", it.url);
+                o.put("t", p[0]);
+                o.put("u", p[1]);
                 a.put(o);
+            } catch (Exception ignored) {
             }
-            sp.edit().putString(key, a.toString()).apply();
-        } catch (Exception ignored) {
         }
+        sp.edit().putString(key, a.toString()).apply();
     }
 
-    static int add(SharedPreferences sp, String key, String title, String url, int max) {
-        List<Item> items = load(sp, key);
-        for (Item it : items) {
-            if (same(it.url, url)) return DUPLICATE;
-        }
-        if (items.size() >= max) return FULL;
-        items.add(new Item(title == null || title.isEmpty() ? url : title, url));
-        write(sp, key, items);
-        return ADDED;
+    static void add(SharedPreferences sp, String key, String title, String url) {
+        List<String[]> l = load(sp, key);
+        for (String[] p : l) if (p[1].equals(url)) return;
+        l.add(new String[]{title, url});
+        save(sp, key, l);
     }
 
     static void remove(SharedPreferences sp, String key, String url) {
-        List<Item> items = load(sp, key);
-        List<Item> keep = new ArrayList<>();
-        for (Item it : items) {
-            if (!same(it.url, url)) keep.add(it);
+        List<String[]> l = load(sp, key);
+        for (int i = 0; i < l.size(); i++) {
+            if (l.get(i)[1].equals(url)) {
+                l.remove(i);
+                break;
+            }
         }
-        write(sp, key, keep);
+        save(sp, key, l);
     }
 }

@@ -1,7 +1,11 @@
 package com.example.floatapps;
 
 import android.app.Activity;
+import android.content.Intent;
 import android.content.SharedPreferences;
+import android.net.Uri;
+import android.provider.Settings;
+import android.webkit.WebView;
 import android.os.Bundle;
 import android.view.MenuItem;
 import android.view.View;
@@ -187,6 +191,25 @@ public class SettingsActivity extends Activity {
             clearKeys(".x", ".y", ".w", ".h");
             Toast.makeText(this, "รีเซ็ตแล้ว มีผลตอนเปิดหน้าต่างครั้งถัดไป",
                     Toast.LENGTH_SHORT).show();
+        }));
+
+        // ---- stability / resources ----
+        box.addView(text("ความเสถียรและประหยัดทรัพยากร", 16, true));
+        box.addView(text("ถ้าระบบปิดแอป จะเปิดหน้าต่างเดิมกลับมาให้เอง และหน้า Facebook/แปลที่ย่ออยู่จะถูกพักเพื่อประหยัดแรง",
+                13, false));
+        box.addView(button("ยกเว้นการจำกัดแบตเตอรี่ (กันแอปถูกปิด)", v -> {
+            try {
+                startActivity(new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                        Uri.parse("package:" + getPackageName())));
+            } catch (Exception e) {
+                startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS));
+            }
+        }));
+        box.addView(button("ล้างแคชเว็บ (คืนพื้นที่/แรม)", v -> {
+            WebView tmp = new WebView(this);
+            tmp.clearCache(true);
+            tmp.destroy();
+            Toast.makeText(this, "ล้างแคชแล้ว", Toast.LENGTH_SHORT).show();
         }));
 
         ScrollView sv = new ScrollView(this);
